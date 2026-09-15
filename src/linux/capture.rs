@@ -1,10 +1,8 @@
-use std::{ops::Deref, sync::atomic::Ordering};
-
 use crate::{
     capture_desc::CaptureDescriptor,
     config::CaptureConfig,
     error::{CaptureError, Result},
-    frame::Frame,
+    frame::{AudioFrame, VideoFrame},
     platform::pipewire::PipewireSession,
 };
 
@@ -13,11 +11,19 @@ use crossbeam_channel::{Receiver, bounded};
 impl CaptureConfig {
     /// Spawns a thread to capture the screen and returns a `CaptureDesc` that can be used to control the capture.
     pub fn create(self) -> Result<CaptureDesc> {
-        let (tx, rx) = bounded(self.channel_capacity);
-        let pipewire_session = PipewireSession::new(tx, self.video, self.audio);
+        let (v_tx, v_rx) = bounded(self.video.channel_capacity);
+        let (a_tx, a_rx) = match self.audio.as_ref() {
+            Some(audio) => {
+                let (tx, rx) = bounded(audio.channel_capacity);
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
+        let pipewire_session = PipewireSession::new(v_tx, a_tx, self.video, self.audio)?;
         Ok(CaptureDesc {
             pipewire_session,
-            rx: Some(rx),
+            v_rx: Some(v_rx),
+            a_rx,
         })
     }
 }
@@ -28,7 +34,8 @@ impl CaptureConfig {
 #[derive(Debug)]
 pub struct CaptureDesc {
     pipewire_session: PipewireSession,
-    rx: Option<Receiver<Frame>>,
+    v_rx: Option<Receiver<VideoFrame>>,
+    a_rx: Option<Receiver<AudioFrame>>,
 }
 
 impl TryFrom<CaptureConfig> for CaptureDesc {
@@ -41,9 +48,15 @@ impl TryFrom<CaptureConfig> for CaptureDesc {
 
 impl CaptureDescriptor for CaptureDesc {
     fn terminate(&self) {
-        self.pipewire_session
-            .terminate
-            .store(true, Ordering::Relaxed);
+        self.pipewire_session.terminate();
+    }
+
+    fn video(&self) -> &Receiver<VideoFrame> {
+        self.v_rx.as_ref().unwrap()
+    }
+
+    fn audio(&self) -> Option<&Receiver<AudioFrame>> {
+        self.a_rx.as_ref()
     }
 
     fn size(&self) -> (u32, u32) {
@@ -55,16 +68,9 @@ impl CaptureDescriptor for CaptureDesc {
     }
 }
 
-impl Deref for CaptureDesc {
-    type Target = Receiver<Frame>;
-
-    fn deref(&self) -> &Self::Target {
-        self.rx.as_ref().unwrap()
-    }
-}
-
 impl Drop for CaptureDesc {
     fn drop(&mut self) {
-        let _ = self.rx.take();
+        let _ = self.v_rx.take();
+        let _ = self.a_rx.take();
     }
 }

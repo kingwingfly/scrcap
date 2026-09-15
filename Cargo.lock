@@ -2078,9 +2078,11 @@ dependencies = [
  "dbus",
  "dispatch2",
  "env_logger",
+ "libc",
  "log",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "objc2-core-audio-types",
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
@@ -2089,17 +2091,12 @@ dependencies = [
  "pipewire",
  "pollster",
  "rand",
- "scrframe",
  "thiserror 2.0.20",
  "tracing",
  "wgpu",
  "windows",
  "winit",
 ]
-
-[[package]]
-name = "scrframe"
-version = "0.1.0"
 
 [[package]]
 name = "sctk-adwaita"

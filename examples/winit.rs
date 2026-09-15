@@ -17,7 +17,7 @@ use winit::{
     window::{Window, WindowId, WindowLevel},
 };
 
-use scrcap::{CaptureConfig, CaptureDesc, CaptureDescriptor as _, Frame, Target, VideoConfig};
+use scrcap::{CaptureConfig, CaptureDesc, CaptureDescriptor as _, Target, VideoConfig, VideoFrame};
 
 fn main() {
     env_logger::builder()
@@ -79,8 +79,9 @@ impl ApplicationHandler for App {
         let window = event_loop
             .create_window(Window::default_attributes().with_window_level(WindowLevel::AlwaysOnTop))
             .expect("Window should be created");
-        self.state =
-            Some(pollster::block_on(State::new(window)).expect("State should be initialized"));
+        let state = pollster::block_on(State::new(window)).expect("State should be initialized");
+        state.window.request_redraw();
+        self.state = Some(state);
     }
 
     fn window_event(
@@ -191,10 +192,11 @@ impl State {
             hide.push(handle);
         }
         let capture_desc = CaptureConfig {
-            channel_capacity: 2,
             video: VideoConfig {
+                channel_capacity: 2,
                 hide,
                 target: Target::Primary,
+                fps: Some(60),
             },
             audio: None,
         }
@@ -429,29 +431,25 @@ impl State {
     }
 
     fn update(&mut self) {
-        loop {
-            if let Frame::Video { vframe, size, .. } = self.capture_desc.recv().unwrap() {
-                self.queue.write_texture(
-                    // Tells wgpu where to copy the pixel data
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.diffuse_texture.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    // The actual pixel data
-                    &vframe,
-                    // The layout of the texture
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(4 * size.0),
-                        rows_per_image: Some(size.1),
-                    },
-                    self.diffuse_texture.texture_size,
-                );
-                break;
-            }
-        }
+        let VideoFrame { vframe, size, .. } = self.capture_desc.video().recv().unwrap();
+        self.queue.write_texture(
+            // Tells wgpu where to copy the pixel data
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.diffuse_texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            // The actual pixel data
+            &vframe,
+            // The layout of the texture
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * size.0),
+                rows_per_image: Some(size.1),
+            },
+            self.diffuse_texture.texture_size,
+        );
     }
 }
 

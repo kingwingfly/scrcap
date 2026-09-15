@@ -1,21 +1,23 @@
 //! CaptureDesc trait
 
-use std::ops::Deref;
-
 use crossbeam_channel::Receiver;
 
 use crate::{
-    Frame,
     config::CaptureConfig,
     error::{CaptureError, Result},
+    frame::{AudioFrame, VideoFrame},
 };
 
 /// CaptureDesc trait
-pub trait CaptureDescriptor:
-    Deref<Target = Receiver<Frame>> + TryFrom<CaptureConfig, Error = CaptureError>
-{
+pub trait CaptureDescriptor: TryFrom<CaptureConfig, Error = CaptureError> {
     /// Stop the capture.
     fn terminate(&self);
+
+    /// The captured video frames.
+    fn video(&self) -> &Receiver<VideoFrame>;
+
+    /// The captured audio frames, if audio was configured.
+    fn audio(&self) -> Option<&Receiver<AudioFrame>>;
 
     /// Width and height of the captured video.
     fn size(&self) -> (u32, u32);

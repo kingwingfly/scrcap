@@ -1,0 +1,43 @@
+[workspace]
+members = ["scrcap", "scrframe"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+scrframe = { path = "scrframe" }
+
+crossbeam-channel = "0.5.17"
+parking_lot = { version = "0.12.5", features = ["arc_lock", "send_guard"] }
+rand = "0.10.2"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+
+# Windows
+windows = "0.62.2"
+
+# macOS
+block2 = "0.6.2"
+crossbeam-utils = "0.8.23"
+dispatch2 = "0.3.1"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-screen-capture-kit = "0.3.2"
+
+# Linux
+dbus = "0.9.12"
+pipewire = "0.10.1"
+
+# Examples only (used from scrcap's [dev-dependencies])
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }    # data from cpu to gpu
+env_logger = "0.11.11"
+log = "0.4.34"
+pollster = "1.0.1"
+wgpu = "30.0.1"
+winit = "0.30.13"

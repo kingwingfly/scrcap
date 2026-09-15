@@ -1,0 +1,59 @@
+[package]
+name = "scrcap"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+scrframe = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+rand = { workspace = true, optional = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Foundation_Metadata",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+block2 = { workspace = true }
+dispatch2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-core-media = { workspace = true }
+objc2-core-video = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-screen-capture-kit = { workspace = true, features = ["SCShareableContent"] }
+crossbeam-utils = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { workspace = true }
+dbus = { workspace = true }
+
+[dev-dependencies]
+wgpu = { workspace = true }
+winit = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+
+[features]
+default = []
+dummy = ["dep:rand"]

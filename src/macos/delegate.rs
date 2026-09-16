@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crossbeam_channel::Sender;
@@ -44,6 +44,8 @@ pub(crate) struct StreamOutput {
     a_tx: Option<Sender<AudioFrame>>,
     gate: Mutex<FpsGate>,
     size: Arc<Mutex<(u32, u32)>>,
+    /// The last size written to `size`, packed as `width << 32 | height`.
+    last_size: AtomicU64,
     sample_rate: Option<Arc<Mutex<Option<i32>>>>,
 }
 
@@ -100,7 +102,10 @@ define_class!(
                         let Some(vframe) = vframe else {
                             return;
                         };
-                        *self.ivars().size.lock() = (width as u32, height as u32);
+                        let packed = (width as u64) << 32 | height as u64;
+                        if self.ivars().last_size.swap(packed, Ordering::Relaxed) != packed {
+                            *self.ivars().size.lock() = (width as u32, height as u32);
+                        }
                         let _ = self.ivars().v_tx.try_send(VideoFrame {
                             vframe,
                             size: (width as u32, height as u32),
@@ -268,6 +273,7 @@ impl VideoStreamOutput {
                 a_tx,
                 gate: Mutex::new(FpsGate::new(fps)),
                 size,
+                last_size: AtomicU64::new(0),
                 sample_rate,
             });
             msg_send![super(this), init]

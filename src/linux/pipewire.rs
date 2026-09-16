@@ -42,7 +42,7 @@ use pipewire::{
 
 use crate::{
     config::{AudioConfig, Target, VideoConfig},
-    error::{CaptureError, Result},
+    error::{CaptureError, Result, Unsupported},
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
@@ -95,12 +95,14 @@ impl PipewireSession {
     ) -> Result<Self> {
         if !video.hide.is_empty() {
             // Neither Wayland nor X11 lets a client opt a window out of a screencast.
-            return Err(CaptureError::Unsupported);
+            return Err(Unsupported::HideWindows.into());
         }
         let source_types = match video.target {
             Target::Pick => 0, // every available source type
             Target::Primary | Target::Monitor(_) => SOURCE_TYPE_MONITOR,
-            Target::Window(_) | Target::WindowName(_) => return Err(CaptureError::Unsupported),
+            Target::Window(_) | Target::WindowName(_) => {
+                return Err(Unsupported::WindowTarget.into());
+            }
         };
 
         let fps = video.fps;
@@ -182,17 +184,15 @@ impl PipewireSession {
                         &Value::Object(obj),
                     )
                     .map_err(|e| {
-                        CaptureError::Portal(format!("failed to serialize video format: {e}"))
+                        error!("failed to serialize video format: {e}");
+                        CaptureError::SpaParams
                     })?
                     .0
                     .into_inner();
                     let meta = meta_header_param()?;
                     let mut params = [
-                        Pod::from_bytes(&values).ok_or_else(|| {
-                            CaptureError::Portal("invalid video format pod".into())
-                        })?,
-                        Pod::from_bytes(&meta)
-                            .ok_or_else(|| CaptureError::Portal("invalid meta pod".into()))?,
+                        Pod::from_bytes(&values).ok_or_else(|| CaptureError::SpaParams)?,
+                        Pod::from_bytes(&meta).ok_or(CaptureError::SpaParams)?,
                     ];
                     video_stream.connect(
                         Direction::Input,
@@ -242,17 +242,15 @@ impl PipewireSession {
                             &Value::Object(obj),
                         )
                         .map_err(|e| {
-                            CaptureError::Portal(format!("failed to serialize audio format: {e}"))
+                            error!("failed to serialize audio format: {e}");
+                            CaptureError::SpaParams
                         })?
                         .0
                         .into_inner();
                         let meta = meta_header_param()?;
                         let mut params = [
-                            Pod::from_bytes(&values).ok_or_else(|| {
-                                CaptureError::Portal("invalid audio format pod".into())
-                            })?,
-                            Pod::from_bytes(&meta)
-                                .ok_or_else(|| CaptureError::Portal("invalid meta pod".into()))?,
+                            Pod::from_bytes(&values).ok_or_else(|| CaptureError::SpaParams)?,
+                            Pod::from_bytes(&meta).ok_or(CaptureError::SpaParams)?,
                         ];
                         // No target: `node_id` is the portal's *video* node, and an audio
                         // stream aimed at it can never link. `STREAM_CAPTURE_SINK` above is
@@ -344,7 +342,10 @@ fn meta_header_param() -> Result<Vec<u8>> {
     };
     Ok(
         PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
-            .map_err(|e| CaptureError::Portal(format!("failed to serialize meta param: {e}")))?
+            .map_err(|e| {
+                error!("failed to serialize meta param: {e}");
+                CaptureError::SpaParams
+            })?
             .0
             .into_inner(),
     )

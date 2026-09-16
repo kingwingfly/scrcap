@@ -6,11 +6,11 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use super::delegate::{PickerObserver, StreamDelegate, VideoStreamOutput};
+use super::delegate::{PickerObserver, StreamDelegate, VideoStreamOutput, ns_error};
 use crate::{
     capture_desc::CaptureDescriptor,
     config::{CaptureConfig, Target},
-    error::{CaptureError, Result},
+    error::{CaptureError, Result, ScreenCaptureKitError, Unsupported},
     frame::{AudioFrame, VideoFrame},
 };
 
@@ -46,10 +46,7 @@ impl CaptureConfig {
     pub fn create(self) -> Result<CaptureDesc> {
         self.validate()?;
         let re = match &self.video.target {
-            Target::WindowName(pattern) => Some(
-                Regex::new(pattern)
-                    .map_err(|e| CaptureError::InvalidTarget(format!("bad window regex: {e}")))?,
-            ),
+            Target::WindowName(pattern) => Some(Regex::new(pattern)?),
             _ => None,
         };
 
@@ -100,7 +97,7 @@ impl CaptureConfig {
                 // Set by the stream delegate when the stream stops itself.
                 let stopped = Arc::new(AtomicBool::new(false));
                 // The delegate answers this too, so the wait below never needs a timeout.
-                let (stop_tx, stop_rx) = bounded::<Option<String>>(1);
+                let (stop_tx, stop_rx) = bounded::<Option<CaptureError>>(1);
                 let run = || -> Result<(Retained<SCStream>, Retained<VideoStreamOutput>, bool)> {
                     let (filter, width, height) = if target == Target::Pick {
                         present_picker(&excluded)?
@@ -109,15 +106,13 @@ impl CaptureConfig {
                         let block = RcBlock::new(
                             move |shareable: *mut SCShareableContent, e: *mut NSError| {
                                 if !e.is_null() {
-                                    let _ = target_tx.send(Err(CaptureError::ScreenCaptureKit(
-                                        (*e).to_string(),
-                                    )));
+                                    let _ = target_tx.send(Err(ns_error(&*e)));
                                     return;
                                 }
                                 if shareable.is_null() {
-                                    let _ = target_tx.send(Err(CaptureError::ScreenCaptureKit(
-                                        "getShareableContent returned no content".into(),
-                                    )));
+                                    let _ = target_tx.send(Err(
+                                        ScreenCaptureKitError::NoShareableContent.into(),
+                                    ));
                                     return;
                                 }
                                 let _ = target_tx.send(content_filter(
@@ -148,7 +143,7 @@ impl CaptureConfig {
                     if stream_config.respondsToSelector(sel!(setCapturesAudio:)) {
                         stream_config.setCapturesAudio(self.audio.is_some());
                     } else if self.audio.is_some() {
-                        return Err(CaptureError::Unsupported);
+                        return Err(Unsupported::Audio.into());
                     }
                     if stream_config.respondsToSelector(sel!(setCaptureMicrophone:)) {
                         stream_config.setCaptureMicrophone(false);
@@ -184,7 +179,7 @@ impl CaptureConfig {
                             SCStreamOutputType::Screen,
                             Some(&video_queue),
                         )
-                        .map_err(|e| CaptureError::ScreenCaptureKit(e.to_string()))?;
+                        .map_err(|_| ScreenCaptureKitError::OutputAttach)?;
                     let has_audio = self.audio.is_some();
                     if has_audio {
                         let queue =
@@ -195,17 +190,17 @@ impl CaptureConfig {
                                 SCStreamOutputType::Audio,
                                 Some(&queue),
                             )
-                            .map_err(|e| CaptureError::ScreenCaptureKit(e.to_string()))?;
+                            .map_err(|_| ScreenCaptureKitError::OutputAttach)?;
                     }
 
                     let (start_tx, start_rx) = bounded(1);
                     stream.startCaptureWithCompletionHandler(Some(&RcBlock::new(
                         move |e: *mut NSError| {
-                            let _ = start_tx.send((!e.is_null()).then(|| (*e).to_string()));
+                            let _ = start_tx.send((!e.is_null()).then(|| ns_error(&*e)));
                         },
                     )));
                     match start_rx.recv() {
-                        Ok(Some(e)) => return Err(CaptureError::ScreenCaptureKit(e)),
+                        Ok(Some(e)) => return Err(e),
                         Ok(None) => {}
                         Err(_) => return Err(CaptureError::WorkerGone),
                     }
@@ -244,7 +239,7 @@ impl CaptureConfig {
                     let stop_tx = stop_tx.clone();
                     stream.stopCaptureWithCompletionHandler(Some(&RcBlock::new(
                         move |e: *mut NSError| {
-                            let _ = stop_tx.try_send((!e.is_null()).then(|| (*e).to_string()));
+                            let _ = stop_tx.try_send((!e.is_null()).then(|| ns_error(&*e)));
                         },
                     )));
                 }
@@ -276,7 +271,7 @@ impl CaptureConfig {
 unsafe fn present_picker(excluded: &[u32]) -> Result<(Retained<SCContentFilter>, usize, usize)> {
     unsafe {
         if AnyClass::get(c"SCContentSharingPicker").is_none() {
-            return Err(CaptureError::Unsupported);
+            return Err(Unsupported::Picker.into());
         }
         let (tx, rx) = bounded(1);
         let observer = PickerObserver::new(tx);
@@ -294,7 +289,7 @@ unsafe fn present_picker(excluded: &[u32]) -> Result<(Retained<SCContentFilter>,
         picker.setActive(false);
         picker.removeObserver(ProtocolObject::from_ref(&*observer));
         let filter = filter?;
-        let (width, height) = filter_size(&filter).ok_or(CaptureError::Unsupported)?;
+        let (width, height) = filter_size(&filter).ok_or(Unsupported::Picker)?;
         Ok((filter, width, height))
     }
 }
@@ -373,7 +368,7 @@ unsafe fn content_filter(
                     })
                     .map(|window| from_window(&window))
             }),
-            Target::Pick => return Err(CaptureError::Unsupported),
+            Target::Pick => return Err(Unsupported::Picker.into()),
         };
         let (filter, points) = filter.ok_or(CaptureError::TargetNotFound)?;
         let (width, height) = filter_size(&filter).unwrap_or(points);

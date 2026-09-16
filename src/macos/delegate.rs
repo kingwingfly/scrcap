@@ -25,13 +25,13 @@ use objc2_core_video::{
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver, SCStream,
-    SCStreamDelegate, SCStreamOutput, SCStreamOutputType,
+    SCStreamDelegate, SCStreamErrorCode, SCStreamErrorDomain, SCStreamOutput, SCStreamOutputType,
 };
 use parking_lot::Mutex;
 use tracing::error;
 
 use crate::{
-    error::{CaptureError, Result},
+    error::{CaptureError, Result, ScreenCaptureKitError},
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
@@ -271,6 +271,29 @@ impl VideoStreamOutput {
     }
 }
 
+/// The most actionable [`CaptureError`] an `NSError` from ScreenCaptureKit stands for.
+///
+/// The codes a caller can respond to become top-level variants; the rest keep their raw
+/// `NSError` code so it can still be looked up.
+pub(crate) fn ns_error(e: &NSError) -> CaptureError {
+    let code = e.code();
+    if &*e.domain() != unsafe { SCStreamErrorDomain } {
+        return ScreenCaptureKitError::Other(code).into();
+    }
+    match SCStreamErrorCode(code) {
+        SCStreamErrorCode::UserDeclined | SCStreamErrorCode::MissingEntitlements => {
+            CaptureError::PermissionDenied
+        }
+        SCStreamErrorCode::UserStopped | SCStreamErrorCode::SystemStoppedStream => {
+            ScreenCaptureKitError::Stopped.into()
+        }
+        SCStreamErrorCode::FailedToStart | SCStreamErrorCode::FailedToStartAudioCapture => {
+            ScreenCaptureKitError::FailedToStart.into()
+        }
+        _ => ScreenCaptureKitError::Stream(code).into(),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamDelegateIvars {
     unparker: Unparker,
@@ -279,7 +302,7 @@ pub(crate) struct StreamDelegateIvars {
     stopped: Arc<AtomicBool>,
     /// Also answers the worker's stop wait, so that wait is satisfied whether the worker
     /// stopped the stream or the stream stopped itself first.
-    stop_tx: Sender<Option<String>>,
+    stop_tx: Sender<Option<CaptureError>>,
 }
 
 define_class!(
@@ -306,7 +329,7 @@ impl StreamDelegate {
     pub(crate) fn new(
         unparker: Unparker,
         stopped: Arc<AtomicBool>,
-        stop_tx: Sender<Option<String>>,
+        stop_tx: Sender<Option<CaptureError>>,
     ) -> Retained<Self> {
         unsafe {
             let this = Self::alloc().set_ivars(StreamDelegateIvars {
@@ -350,15 +373,12 @@ define_class!(
             _picker: &SCContentSharingPicker,
             _stream: Option<&SCStream>,
         ) {
-            let _ = self.ivars().tx.try_send(Err(CaptureError::TargetNotFound));
+            let _ = self.ivars().tx.try_send(Err(CaptureError::Cancelled));
         }
 
         #[unsafe(method(contentSharingPickerStartDidFailWithError:))]
         unsafe fn contentSharingPickerStartDidFailWithError(&self, error: &NSError) {
-            let _ = self
-                .ivars()
-                .tx
-                .try_send(Err(CaptureError::ScreenCaptureKit(error.to_string())));
+            let _ = self.ivars().tx.try_send(Err(ns_error(error)));
         }
     }
 );

@@ -70,7 +70,7 @@ use super::utils::{hide_window_from_capture, restore_window_capture_affinity};
 use crate::{
     capture_desc::CaptureDescriptor,
     config::{AudioConfig, CaptureConfig, Target, VideoConfig},
-    error::{CaptureError, Result},
+    error::{CaptureError, Result, Unsupported},
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
@@ -134,8 +134,7 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
 }
 
 fn window_by_title(pattern: &str) -> Result<HWND> {
-    let re = Regex::new(pattern)
-        .map_err(|e| CaptureError::InvalidTarget(format!("bad window regex: {e}")))?;
+    let re = Regex::new(pattern).map_err(CaptureError::BadWindowRegex)?;
     let mut found = (re, None);
     unsafe {
         let _ = EnumWindows(Some(collect_window), LPARAM(&mut found as *mut _ as isize));
@@ -189,7 +188,7 @@ fn capture_item(target: Target) -> Result<GraphicsCaptureItem> {
             // Dismissing yields a null item, which windows-rs reports as a success-coded error.
             match picker.PickSingleItemAsync()?.join() {
                 Ok(item) => item,
-                Err(e) if e.code().is_ok() => return Err(CaptureError::TargetNotFound),
+                Err(e) if e.code().is_ok() => return Err(CaptureError::Cancelled),
                 Err(e) => return Err(CaptureError::Win(e)),
             }
         }
@@ -210,7 +209,7 @@ impl VideoConfig {
         terminate: Arc<AtomicBool>,
     ) -> Result<CaptureVideoDesc> {
         if !GraphicsCaptureSession::IsSupported()? {
-            return Err(CaptureError::Unsupported);
+            return Err(Unsupported::ScreenCapture.into());
         }
         let fps = self.fps;
 
@@ -271,9 +270,8 @@ impl VideoConfig {
                             None,
                             Some(&mut d3d_device_context),
                         )?;
-                        let d3d_device = d3d_device.ok_or(CaptureError::Unsupported)?;
-                        let d3d_device_context =
-                            d3d_device_context.ok_or(CaptureError::Unsupported)?;
+                        let d3d_device = d3d_device.ok_or(Unsupported::Direct3D)?;
+                        let d3d_device_context = d3d_device_context.ok_or(Unsupported::Direct3D)?;
                         let dxgi_device: IDXGIDevice = d3d_device.cast()?;
                         let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)?;
                         let device: IDirect3DDevice = inspectable.cast()?;
@@ -574,7 +572,7 @@ impl AudioConfig {
                     CoTaskMemFree(Some(format as *const _));
                     init?;
                     let Some(sample_fmt) = sample_fmt else {
-                        return Err(CaptureError::Unsupported);
+                        return Err(Unsupported::SampleFormat.into());
                     };
 
                     let buffer_frames = audio_client.GetBufferSize()?; // 1 frame = nb_channels(samples)

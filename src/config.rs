@@ -20,9 +20,7 @@ impl CaptureConfig {
         let zero = self.video.channel_capacity == 0
             || self.audio.as_ref().is_some_and(|a| a.channel_capacity == 0);
         if zero {
-            return Err(CaptureError::InvalidConfig(
-                "channel_capacity must be at least 1".into(),
-            ));
+            return Err(CaptureError::ZeroChannelCapacity);
         }
         Ok(())
     }
@@ -40,21 +38,23 @@ pub struct VideoConfig {
     /// - Windows: HWND
     /// - macOS: NSView ptr, resolved to its window's `CGWindowID` on the main thread, so
     ///   that thread must be running its loop if `create` is called from anywhere else.
-    /// - Linux: unsupported, a non-empty list is [`CaptureError::Unsupported`]. Neither
+    /// - Linux: unsupported, a non-empty list is [`Unsupported::HideWindows`]. Neither
     ///   Wayland nor X11 lets a client opt a window out of a screencast.
     ///
-    /// [`CaptureError::Unsupported`]: crate::error::CaptureError::Unsupported
+    /// [`Unsupported::HideWindows`]: crate::error::Unsupported::HideWindows
     pub hide: Vec<isize>,
     /// The target to capture.
     ///
     /// Everything is supported everywhere except where noted:
     /// - Linux: the XDG portal picker always makes the final choice, so `Primary` and
     ///   `Monitor` only restrict it to monitors (the index is *not* honoured), and
-    ///   `Window`/`WindowName` are [`CaptureError::Unsupported`].
+    ///   `Window`/`WindowName` are [`Unsupported::WindowTarget`].
     /// - `Pick` blocks until the user chooses, so on Windows and macOS it must not be
-    ///   called from the thread driving the UI.
+    ///   called from the thread driving the UI, and a user who dismisses the picker gets
+    ///   [`CaptureError::Cancelled`].
     ///
-    /// [`CaptureError::Unsupported`]: crate::error::CaptureError::Unsupported
+    /// [`Unsupported::WindowTarget`]: crate::error::Unsupported::WindowTarget
+    /// [`CaptureError::Cancelled`]: crate::error::CaptureError::Cancelled
     pub target: Target,
     /// Cap on delivered frames per second, `None` to leave the source uncapped.
     ///
@@ -84,9 +84,9 @@ pub enum Target {
     /// Capture a specific window by its window id:
     /// - Windows: `HWND`
     /// - macOS: `CGWindowID`
-    /// - Linux: unsupported, [`CaptureError::Unsupported`]
+    /// - Linux: unsupported, [`Unsupported::WindowTarget`]
     ///
-    /// [`CaptureError::Unsupported`]: crate::error::CaptureError::Unsupported
+    /// [`Unsupported::WindowTarget`]: crate::error::Unsupported::WindowTarget
     Window(isize),
     /// Capture the first visible window whose title matches the given regex.
     WindowName(String),

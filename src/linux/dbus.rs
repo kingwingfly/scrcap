@@ -10,7 +10,7 @@ use dbus::{
 };
 use parking_lot::Mutex;
 
-use crate::error::{CaptureError, Result};
+use crate::error::{CaptureError, PortalCall, PortalError, Result};
 
 const TOKEN: &str = "scrcap";
 
@@ -61,13 +61,15 @@ impl DbusScreen {
             .method_call("org.freedesktop.portal.ScreenCast", "CreateSession", (map,))
             .map(|r: (Path<'static>,)| r.0)?;
 
-        let resp = self.recv_resp(path)?;
-        check_response(&resp, "CreateSession")?;
+        let resp = self.recv_resp(path, PortalCall::CreateSession)?;
+        check_response(&resp, PortalCall::CreateSession)?;
         let handle = resp
             .results
             .get("session_handle")
             .and_then(|handle| handle.0.as_str())
-            .ok_or_else(|| portal_err("CreateSession returned no session_handle"))?;
+            .ok_or(PortalError::MalformedReply {
+                call: PortalCall::CreateSession,
+            })?;
         let handle = Path::from(handle.to_string());
 
         // select source
@@ -83,9 +85,11 @@ impl DbusScreen {
         } else {
             let wanted = available & wanted_source_types;
             if wanted == 0 {
-                return Err(portal_err(format!(
-                    "the portal offers no source of the requested kind (wanted {wanted_source_types:#x}, available {available:#x})"
-                )));
+                return Err(PortalError::NoMatchingSource {
+                    wanted: wanted_source_types,
+                    available,
+                }
+                .into());
             }
             wanted
         };
@@ -105,8 +109,8 @@ impl DbusScreen {
             )
             .map(|r: (Path<'static>,)| r.0)?;
 
-        let resp = self.recv_resp(path)?;
-        check_response(&resp, "SelectSources")?;
+        let resp = self.recv_resp(path, PortalCall::SelectSources)?;
+        check_response(&resp, PortalCall::SelectSources)?;
 
         // start capturing
         let path = proxy
@@ -117,8 +121,8 @@ impl DbusScreen {
             )
             .map(|r: (Path<'static>,)| r.0)?;
 
-        let resp = self.recv_resp(path)?;
-        check_response(&resp, "Start")?;
+        let resp = self.recv_resp(path, PortalCall::Start)?;
+        check_response(&resp, PortalCall::Start)?;
         let pipewire_node_id = resp
             .results
             .get("streams")
@@ -129,11 +133,13 @@ impl DbusScreen {
             .and_then(|item| item.as_iter())
             .and_then(|mut iter| iter.next())
             .and_then(|item| item.as_u64())
-            .ok_or_else(|| portal_err("Start returned no usable PipeWire node id"))?;
+            .ok_or(PortalError::MalformedReply {
+                call: PortalCall::Start,
+            })?;
         Ok(pipewire_node_id as u32)
     }
 
-    fn recv_resp(&self, path: Path<'static>) -> Result<Response> {
+    fn recv_resp(&self, path: Path<'static>, call: PortalCall) -> Result<Response> {
         let resp = Arc::new(Mutex::new(None));
         let mut resp_guard = resp.lock_arc();
         let mut rule = MatchRule::new();
@@ -150,22 +156,17 @@ impl DbusScreen {
         loop {
             self.connection.process(Duration::from_millis(100))?;
             if let Some(mut guard) = resp.try_lock() {
-                return guard
-                    .take()
-                    .ok_or_else(|| portal_err("portal request produced no response"));
+                return guard.take().ok_or(PortalError::NoResponse { call }.into());
             }
         }
     }
 }
 
-fn check_response(resp: &Response, call: &str) -> Result<()> {
+fn check_response(resp: &Response, call: PortalCall) -> Result<()> {
     match resp.response {
         0 => Ok(()),
-        1 => Err(portal_err(format!("{call} was cancelled by the user"))),
-        other => Err(portal_err(format!("{call} failed with response {other}"))),
+        // The spec's "the user cancelled the interaction".
+        1 => Err(CaptureError::Cancelled),
+        response => Err(PortalError::Refused { call, response }.into()),
     }
-}
-
-fn portal_err(msg: impl Into<String>) -> CaptureError {
-    CaptureError::Portal(msg.into())
 }

@@ -31,8 +31,9 @@ use pipewire::{
             Object, Pod, Property, PropertyFlags, Value, object, property, serialize::PodSerializer,
         },
         sys::{
-            SPA_META_Header, SPA_PARAM_META_size, SPA_PARAM_META_type, SPA_PARAM_Meta,
-            SPA_TYPE_OBJECT_ParamMeta, SPA_VIDEO_FORMAT_BGRA, spa_buffer, spa_meta_header,
+            SPA_CHUNK_FLAG_CORRUPTED, SPA_META_Header, SPA_PARAM_META_size, SPA_PARAM_META_type,
+            SPA_PARAM_Meta, SPA_TYPE_OBJECT_ParamMeta, SPA_VIDEO_FORMAT_BGRA, spa_buffer,
+            spa_meta_header,
         },
         utils::{Direction, Fraction, SpaTypes},
     },
@@ -45,6 +46,7 @@ use crate::{
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
+    util::pack_rows,
 };
 
 use super::dbus::{DbusScreen, SOURCE_TYPE_MONITOR};
@@ -383,24 +385,23 @@ fn video_process_callback(stream: &Stream, data: &mut VideoData) {
                 let plane = spa_buffer.datas; // first elem
                 let chunk = &*(*plane).chunk;
                 let row_bytes = size.width as usize * 4;
-                let stride = chunk.stride as usize;
+                let stride = if chunk.stride > 0 {
+                    chunk.stride as usize
+                } else {
+                    row_bytes
+                };
                 let height = size.height as usize;
-                // The producer may pad rows, but `size` promises width*height*4.
-                let vframe = if stride == row_bytes || chunk.stride <= 0 {
-                    std::slice::from_raw_parts((*plane).data as *const u8, chunk.size as usize)
-                        .to_vec()
-                } else if stride < row_bytes || stride * height > chunk.size as usize {
+                let empty = chunk.size == 0
+                    || chunk.flags & SPA_CHUNK_FLAG_CORRUPTED as i32 != 0
+                    || (chunk.size as usize) < stride * height;
+                let base = ((*plane).data as *const u8).add(chunk.offset as usize);
+                let Some(vframe) = (if empty {
+                    None
+                } else {
+                    pack_rows(base, stride, row_bytes, height)
+                }) else {
                     stream.queue_raw_buffer(buffer);
                     return;
-                } else {
-                    let padded =
-                        std::slice::from_raw_parts((*plane).data as *const u8, stride * height);
-                    let mut packed = Vec::with_capacity(row_bytes * height);
-                    for row in 0..height {
-                        let start = row * stride;
-                        packed.extend_from_slice(&padded[start..start + row_bytes]);
-                    }
-                    packed
                 };
                 let _ = data.tx.try_send(VideoFrame {
                     vframe,
@@ -474,9 +475,10 @@ fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
                     Vec::with_capacity(nb_samples * nb_channels as usize * size_of::<f32>());
                 for i in 0..spa_buffer.n_datas as usize {
                     let plane = spa_buffer.datas.add(i);
+                    let chunk = &*(*plane).chunk;
                     aframe.extend_from_slice(core::slice::from_raw_parts(
-                        (*plane).data as *const u8,
-                        (*(*plane).chunk).size as usize,
+                        ((*plane).data as *const u8).add(chunk.offset as usize),
+                        chunk.size as usize,
                     ));
                 }
                 let _ = data.tx.try_send(AudioFrame {

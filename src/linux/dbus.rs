@@ -1,5 +1,11 @@
 //! D-Bus related
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use dbus::{
     MessageType, Path,
@@ -44,20 +50,40 @@ pub struct Session {
     pub fd: OwnedFd,
 }
 
+const PORTAL_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
+
 pub struct DbusScreen {
     connection: Connection,
+    /// Set once the portal that owned [`PORTAL_BUS_NAME`] has left the bus, taking every
+    /// pending request with it.
+    portal_gone: Arc<AtomicBool>,
 }
 
 impl DbusScreen {
     pub fn new() -> Result<Self> {
+        let connection = Connection::new_session()?;
+        let portal_gone = Arc::new(AtomicBool::new(false));
+        let mut rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+        rule.sender = Some(BusName::from("org.freedesktop.DBus"));
+        connection.add_match(rule, {
+            let portal_gone = Arc::clone(&portal_gone);
+            move |(name, old, _new): (String, String, String), _c, _msg| {
+                // An empty old owner is the portal being activated, not going away.
+                if name == PORTAL_BUS_NAME && !old.is_empty() {
+                    portal_gone.store(true, Ordering::Relaxed);
+                }
+                true
+            }
+        })?;
         Ok(Self {
-            connection: Connection::new_session()?,
+            connection,
+            portal_gone,
         })
     }
 
     pub fn start(&self, wanted_source_types: u32) -> Result<Session> {
         let proxy = self.connection.with_proxy(
-            "org.freedesktop.portal.Desktop",
+            PORTAL_BUS_NAME,
             "/org/freedesktop/portal/desktop",
             Duration::from_secs(3),
         );
@@ -77,7 +103,7 @@ impl DbusScreen {
             .method_call("org.freedesktop.portal.ScreenCast", "CreateSession", (map,))
             .map(|r: (Path<'static>,)| r.0)?;
 
-        let resp = self.recv_resp(&request, path)?;
+        let resp = self.recv_resp(&request, path, PortalCall::CreateSession)?;
         check_response(&resp, PortalCall::CreateSession)?;
         let handle = resp
             .results
@@ -126,7 +152,7 @@ impl DbusScreen {
             )
             .map(|r: (Path<'static>,)| r.0)?;
 
-        let resp = self.recv_resp(&request, path)?;
+        let resp = self.recv_resp(&request, path, PortalCall::SelectSources)?;
         check_response(&resp, PortalCall::SelectSources)?;
 
         // start capturing
@@ -144,7 +170,7 @@ impl DbusScreen {
             )
             .map(|r: (Path<'static>,)| r.0)?;
 
-        let resp = self.recv_resp(&request, path)?;
+        let resp = self.recv_resp(&request, path, PortalCall::Start)?;
         check_response(&resp, PortalCall::Start)?;
         let pipewire_node_id = resp
             .results
@@ -206,7 +232,7 @@ impl DbusScreen {
         let mut rule = MatchRule::new();
         rule.path = Some(path);
         rule.msg_type = Some(MessageType::Signal);
-        rule.sender = Some(BusName::from("org.freedesktop.portal.Desktop"));
+        rule.sender = Some(BusName::from(PORTAL_BUS_NAME));
         rule.interface = Some(Interface::from("org.freedesktop.portal.Request"));
         self.connection
             .add_match(rule, move |res: Response, _c, _msg| {
@@ -219,9 +245,15 @@ impl DbusScreen {
     /// Pump the bus until the watched request answers.
     ///
     /// Deliberately without a deadline: `SelectSources` and `Start` raise the portal's own
-    /// picker, so the wait is as long as the user takes. A portal that dies instead shows
-    /// up as an error from `process`.
-    fn recv_resp(&self, request: &Request, actual: Path<'static>) -> Result<Response> {
+    /// picker, so the wait is as long as the user takes. `process` only fails when this
+    /// connection breaks, so a portal that leaves the bus mid-request is caught through
+    /// `portal_gone` instead -- its requests go with it and would never answer.
+    fn recv_resp(
+        &self,
+        request: &Request,
+        actual: Path<'static>,
+        call: PortalCall,
+    ) -> Result<Response> {
         // The path is only predicted; watch the one the portal actually returned too if a
         // portal ever disagrees, so a mismatch costs the race rather than the whole wait.
         if actual != request.path {
@@ -231,6 +263,9 @@ impl DbusScreen {
             self.connection.process(Duration::from_millis(100))?;
             if let Some(resp) = request.slot.lock().take() {
                 return Ok(resp);
+            }
+            if self.portal_gone.load(Ordering::Relaxed) {
+                return Err(PortalError::Vanished { call }.into());
             }
         }
     }

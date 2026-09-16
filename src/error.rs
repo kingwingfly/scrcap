@@ -25,7 +25,9 @@ pub enum CaptureError {
     /// The system refuses to let this process capture the screen.
     ///
     /// macOS: Screen Recording in System Settings > Privacy & Security, which only takes
-    /// effect after the app is restarted. Linux: the portal's permission dialog.
+    /// effect after the app is restarted. Linux never reports this: the portal answers a
+    /// refusal with the same code as any other failure, which arrives as
+    /// `PortalError::Refused`.
     #[error("screen capture permission was denied")]
     PermissionDenied,
 
@@ -76,6 +78,13 @@ pub enum CaptureError {
     #[cfg(target_os = "linux")]
     #[error("the ScreenCast portal: {0}")]
     Portal(#[from] PortalError),
+    /// The PipeWire video stream failed or disconnected before it agreed on a format.
+    ///
+    /// Most often the compositor offers no format this crate takes (BGRA or BGRx), or the
+    /// screencast node went away as the stream connected. PipeWire's reason is logged.
+    #[cfg(target_os = "linux")]
+    #[error("the PipeWire stream failed before agreeing on a format")]
+    StreamFailed,
     /// The PipeWire stream parameters could not be built. A bug in this crate.
     #[cfg(target_os = "linux")]
     #[error("could not build the PipeWire stream parameters")]
@@ -172,6 +181,12 @@ pub enum PortalError {
     #[error("{call} returned a malformed reply")]
     MalformedReply {
         /// The call that answered.
+        call: PortalCall,
+    },
+    /// The portal left the session bus before answering, taking the request with it.
+    #[error("the portal left the bus before answering {call}")]
+    Vanished {
+        /// The call left unanswered.
         call: PortalCall,
     },
 }

@@ -5,7 +5,8 @@ use std::{sync::Arc, thread, time::Duration};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, TryRecvError, bounded};
 use log::{error, info, warn};
-use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use wgpu::rwh::HasWindowHandle;
 use wgpu::{CurrentSurfaceTexture, util::DeviceExt as _};
 use winit::{
     application::ApplicationHandler,
@@ -74,27 +75,42 @@ struct App {
     pending: Option<(Window, Receiver<scrcap::error::Result<CaptureDesc>>)>,
 }
 
+/// This window's own id, in the form [`VideoConfig::hide`] wants, so the preview does not
+/// end up recording itself. Empty where the platform cannot hide a window.
+#[allow(unused_variables, unused_mut)]
+fn hide_self(window: &Window) -> Vec<isize> {
+    let mut hide = Vec::new();
+    #[cfg(target_os = "macos")]
+    if let Ok(wgpu::rwh::RawWindowHandle::AppKit(handle)) =
+        window.window_handle().map(|handle| handle.as_raw())
+    {
+        // The view belongs to this window, so it is alive for the call.
+        let id =
+            unsafe { scrcap::platform::window_id_from_ns_view(handle.ns_view.as_ptr() as isize) };
+        hide.extend(id.map(|id| id as isize));
+    }
+    #[cfg(target_os = "windows")]
+    if let Ok(wgpu::rwh::RawWindowHandle::Win32(handle)) =
+        window.window_handle().map(|handle| handle.as_raw())
+    {
+        hide.push(handle.hwnd.get());
+    }
+    hide
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = event_loop
             .create_window(Window::default_attributes().with_window_level(WindowLevel::AlwaysOnTop))
             .expect("Window should be created");
 
-        let raw = window.window_handle().map(|handle| handle.as_raw());
-        let mut hide = vec![];
-        if let Ok(handle) = raw {
-            match handle {
-                RawWindowHandle::AppKit(handle) => hide.push(handle.ns_view.as_ptr() as isize),
-                RawWindowHandle::Win32(handle) => hide.push(handle.hwnd.get()),
-                _ => {}
-            }
-        }
+        let hide = hide_self(&window);
 
         // `Target::Pick` blocks `create` until the user chooses, and on Windows and macOS the
         // picker answers on this very thread, so `create` has to run somewhere else.
         #[cfg(target_os = "windows")]
-        let target = Target::Pick(match raw {
-            Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
+        let target = Target::Pick(match window.window_handle().map(|handle| handle.as_raw()) {
+            Ok(wgpu::rwh::RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
             _ => panic!("the picker needs a Win32 window to present from"),
         });
         #[cfg(not(target_os = "windows"))]
@@ -152,12 +168,17 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // The window exists before the capture does -- the picker can sit open indefinitely --
+        // so closing it has to work while `self.state` is still empty.
+        if matches!(event, WindowEvent::CloseRequested) {
+            event_loop.exit();
+            return;
+        }
         let Some(state) = &mut self.state else {
             return;
         };
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 if !state.render() {

@@ -174,12 +174,6 @@ pub enum PortalError {
         /// The call that answered.
         call: PortalCall,
     },
-    /// The request signal never carried a response.
-    #[error("{call} produced no response")]
-    NoResponse {
-        /// The call that was waited on.
-        call: PortalCall,
-    },
 }
 
 /// A failure reported by ScreenCaptureKit.

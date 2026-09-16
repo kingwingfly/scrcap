@@ -19,18 +19,17 @@ use crossbeam_channel::{Receiver, bounded};
 use crossbeam_utils::sync::{Parker, Unparker};
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::{
-    AnyThread as _, ClassType as _, MainThreadMarker,
+    AnyThread as _, ClassType as _,
     rc::Retained,
     runtime::{AnyClass, ProtocolObject},
     sel,
 };
-use objc2_app_kit::NSView;
 use objc2_core_media::{CMTime, CMTimeFlags};
 use objc2_foundation::{NSArray, NSError, NSNumber, NSObjectProtocol as _};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCContentSharingPicker, SCContentSharingPickerConfiguration, SCDisplay,
-    SCShareableContent, SCStream, SCStreamConfiguration, SCStreamConfigurationPreset,
-    SCStreamOutputType, SCWindow,
+    SCShareableContent, SCShareableContentStyle, SCStream, SCStreamConfiguration,
+    SCStreamConfigurationPreset, SCStreamOutputType, SCWindow,
 };
 use parking_lot::Mutex;
 use regex::Regex;
@@ -38,11 +37,6 @@ use tracing::error;
 
 impl CaptureConfig {
     /// Spawns a thread to capture the screen and returns a `CaptureDesc` that can be used to control the capture.
-    ///
-    /// `video.hide` reads `NSView`/`NSWindow`, which are main-thread-only, so when this is
-    /// called from anywhere else that work is sent to the main thread and waited on. The
-    /// caller's main thread therefore has to be running its loop -- the same thing
-    /// `Target::Pick` needs of it.
     pub fn create(self) -> Result<CaptureDesc> {
         self.validate()?;
         let re = match &self.video.target {
@@ -62,29 +56,14 @@ impl CaptureConfig {
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
         let audio_desc = self.audio.as_ref().map(|_| CaptureAudioDesc {
-            sample_rate: Arc::new(Mutex::new(0)),
+            sample_rate: Arc::new(Mutex::new(None)),
         });
-        let mut excluded: Vec<u32> = Vec::new();
-        if !self.video.hide.is_empty() {
-            let views = &self.video.hide;
-            let excluded = &mut excluded;
-            let mut resolve = move || {
-                excluded.extend(
-                    views
-                        .iter()
-                        .filter_map(|ns_view| unsafe { Retained::retain(*ns_view as *mut NSView) })
-                        .filter_map(|ns_view| ns_view.window())
-                        // `windowNumber` is the `CGWindowID` ScreenCaptureKit filters on.
-                        .filter_map(|ns_window| u32::try_from(ns_window.windowNumber()).ok()),
-                );
-            };
-            // `NSView`/`NSWindow` are main-thread-only, and `Target::Pick` forces `create`
-            // off it.
-            match MainThreadMarker::new() {
-                Some(_) => resolve(),
-                None => DispatchQueue::main().exec_sync(resolve),
-            }
-        }
+        let excluded: Vec<u32> = self
+            .video
+            .hide
+            .iter()
+            .filter_map(|id| u32::try_from(*id).ok())
+            .collect();
 
         let (setup_tx, setup_rx) = bounded::<Result<()>>(1);
 
@@ -102,29 +81,8 @@ impl CaptureConfig {
                     let (filter, width, height) = if target == Target::Pick {
                         present_picker(&excluded)?
                     } else {
-                        let (target_tx, target_rx) = bounded(1);
-                        let block = RcBlock::new(
-                            move |shareable: *mut SCShareableContent, e: *mut NSError| {
-                                if !e.is_null() {
-                                    let _ = target_tx.send(Err(ns_error(&*e)));
-                                    return;
-                                }
-                                if shareable.is_null() {
-                                    let _ = target_tx.send(Err(
-                                        ScreenCaptureKitError::NoShareableContent.into(),
-                                    ));
-                                    return;
-                                }
-                                let _ = target_tx.send(content_filter(
-                                    &*shareable,
-                                    &target,
-                                    re.as_ref(),
-                                    &excluded,
-                                ));
-                            },
-                        );
-                        SCShareableContent::getShareableContentWithCompletionHandler(&block);
-                        target_rx.recv().map_err(|_| CaptureError::WorkerGone)??
+                        let content = shareable_content()?;
+                        content_filter(&content, &target, re.as_ref(), &excluded)?
                     };
 
                     let stream_config = if SCStreamConfiguration::class()
@@ -268,6 +226,22 @@ impl CaptureConfig {
     }
 }
 
+/// Block on `getShareableContent`, which answers asynchronously on an internal queue.
+unsafe fn shareable_content() -> Result<Retained<SCShareableContent>> {
+    unsafe {
+        let (tx, rx) = bounded(1);
+        let block = RcBlock::new(move |shareable: *mut SCShareableContent, e: *mut NSError| {
+            let _ = tx.send(if !e.is_null() {
+                Err(ns_error(&*e))
+            } else {
+                Retained::retain(shareable).ok_or(ScreenCaptureKitError::NoShareableContent.into())
+            });
+        });
+        SCShareableContent::getShareableContentWithCompletionHandler(&block);
+        rx.recv().map_err(|_| CaptureError::WorkerGone)?
+    }
+}
+
 unsafe fn present_picker(excluded: &[u32]) -> Result<(Retained<SCContentFilter>, usize, usize)> {
     unsafe {
         if AnyClass::get(c"SCContentSharingPicker").is_none() {
@@ -276,21 +250,65 @@ unsafe fn present_picker(excluded: &[u32]) -> Result<(Retained<SCContentFilter>,
         let (tx, rx) = bounded(1);
         let observer = PickerObserver::new(tx);
         let picker = SCContentSharingPicker::sharedPicker();
-        if !excluded.is_empty() {
-            let ids: Vec<_> = excluded.iter().copied().map(NSNumber::new_u32).collect();
-            let config = SCContentSharingPickerConfiguration::new();
-            config.setExcludedWindowIDs(&NSArray::from_retained_slice(&ids));
-            picker.setDefaultConfiguration(&config);
-        }
+        // The picker is a process-wide singleton, so this configuration outlives the call
+        // and would silently narrow the next one. Always install ours, always put back
+        // what was there.
+        let previous = picker.defaultConfiguration();
+        let config = SCContentSharingPickerConfiguration::new();
+        let ids: Vec<_> = excluded.iter().copied().map(NSNumber::new_u32).collect();
+        config.setExcludedWindowIDs(&NSArray::from_retained_slice(&ids));
+        picker.setDefaultConfiguration(&config);
         picker.addObserver(ProtocolObject::from_ref(&*observer));
         picker.setActive(true);
         picker.present();
-        let filter = rx.recv().map_err(|_| CaptureError::WorkerGone)?;
+        let filter = rx.recv().map_err(|_| CaptureError::WorkerGone);
         picker.setActive(false);
         picker.removeObserver(ProtocolObject::from_ref(&*observer));
-        let filter = filter?;
+        picker.setDefaultConfiguration(&previous);
+
+        let filter = exclude_from_picked(filter??, excluded)?;
         let (width, height) = filter_size(&filter).ok_or(Unsupported::Picker)?;
         Ok((filter, width, height))
+    }
+}
+
+/// Carry `hide` into the filter the picker handed back.
+///
+/// `excludedWindowIDs` only keeps a window out of the *picker*; the filter it returns for a
+/// display still contains it. A display filter is therefore rebuilt with the exclusions,
+/// and a window or application filter needs none -- it captures what the user named.
+unsafe fn exclude_from_picked(
+    filter: Retained<SCContentFilter>,
+    excluded: &[u32],
+) -> Result<Retained<SCContentFilter>> {
+    unsafe {
+        if excluded.is_empty() || filter.style() != SCShareableContentStyle::Display {
+            return Ok(filter);
+        }
+        let display = filter
+            .includedDisplays()
+            .firstObject()
+            .ok_or(Unsupported::HideWindows)?;
+        let content = shareable_content()?;
+        Ok(SCContentFilter::initWithDisplay_excludingWindows(
+            SCContentFilter::alloc(),
+            &display,
+            &NSArray::from_retained_slice(&windows_by_id(&content, excluded)),
+        ))
+    }
+}
+
+/// The `SCWindow`s the given `CGWindowID`s name, skipping any that are gone.
+unsafe fn windows_by_id(content: &SCShareableContent, ids: &[u32]) -> Vec<Retained<SCWindow>> {
+    unsafe {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        content
+            .windows()
+            .iter()
+            .filter(|window| ids.contains(&window.windowID()))
+            .collect()
     }
 }
 
@@ -320,11 +338,7 @@ unsafe fn content_filter(
     excluded: &[u32],
 ) -> Result<(Retained<SCContentFilter>, usize, usize)> {
     unsafe {
-        let excluded_windows: Vec<_> = shareable
-            .windows()
-            .iter()
-            .filter(|window| excluded.contains(&window.windowID()))
-            .collect();
+        let excluded_windows = windows_by_id(shareable, excluded);
         // Point size kept as a fallback: `filter_size` needs selectors older systems lack.
         let from_display = |display: &SCDisplay| {
             (
@@ -402,11 +416,11 @@ impl CaptureVideoDesc {
 
 #[derive(Debug)]
 struct CaptureAudioDesc {
-    sample_rate: Arc<Mutex<i32>>,
+    sample_rate: Arc<Mutex<Option<i32>>>,
 }
 
 impl CaptureAudioDesc {
-    fn sample_rate(&self) -> i32 {
+    fn sample_rate(&self) -> Option<i32> {
         *self.sample_rate.lock()
     }
 }
@@ -439,7 +453,7 @@ impl CaptureDescriptor for CaptureDesc {
     fn sample_rate(&self) -> Option<i32> {
         self.audio_desc
             .as_ref()
-            .map(|audio_desc| audio_desc.sample_rate())
+            .and_then(|audio_desc| audio_desc.sample_rate())
     }
 }
 

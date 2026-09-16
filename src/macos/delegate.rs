@@ -44,7 +44,7 @@ pub(crate) struct StreamOutput {
     a_tx: Option<Sender<AudioFrame>>,
     gate: Mutex<FpsGate>,
     size: Arc<Mutex<(u32, u32)>>,
-    sample_rate: Option<Arc<Mutex<i32>>>,
+    sample_rate: Option<Arc<Mutex<Option<i32>>>>,
 }
 
 define_class!(
@@ -122,8 +122,12 @@ define_class!(
                         let Some(sample_fmt) = asbd_sample_fmt(&asbd) else {
                             return;
                         };
+                        let rate = asbd.mSampleRate as i32;
+                        if rate <= 0 || asbd.mChannelsPerFrame == 0 {
+                            return;
+                        }
                         if let Some(sample_rate) = self.ivars().sample_rate.as_ref() {
-                            *sample_rate.lock() = asbd.mSampleRate as i32;
+                            *sample_rate.lock() = Some(rate);
                         }
                         let Some(aframe) = copy_audio_planes(sample_buffer) else {
                             return;
@@ -134,7 +138,7 @@ define_class!(
                         let _ = a_tx.try_send(AudioFrame {
                             aframe,
                             nb_samples,
-                            sample_rate: asbd.mSampleRate as i32,
+                            sample_rate: rate,
                             nb_channels: asbd.mChannelsPerFrame as i32,
                             sample_fmt,
                             ts,
@@ -255,7 +259,7 @@ impl VideoStreamOutput {
         v_tx: Sender<VideoFrame>,
         a_tx: Option<Sender<AudioFrame>>,
         size: Arc<Mutex<(u32, u32)>>,
-        sample_rate: Option<Arc<Mutex<i32>>>,
+        sample_rate: Option<Arc<Mutex<Option<i32>>>>,
         fps: Option<u32>,
     ) -> Retained<Self> {
         unsafe {

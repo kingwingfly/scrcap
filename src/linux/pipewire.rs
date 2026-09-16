@@ -60,12 +60,14 @@ struct VideoData {
     format: VideoInfoRaw,
     size_guard: Option<ArcMutexGuard<RawMutex, (u32, u32)>>,
     size: Arc<Mutex<(u32, u32)>>,
+    /// Answered from the format callback, so `new` only returns once the size is real.
+    setup_tx: Option<Sender<Result<()>>>,
 }
 
 struct AudioData {
     tx: Sender<AudioFrame>,
     format: AudioInfoRaw,
-    sample_rate: Arc<Mutex<i32>>,
+    sample_rate: Arc<Mutex<Option<i32>>>,
 }
 
 pub struct PipewireSession {
@@ -73,7 +75,7 @@ pub struct PipewireSession {
     quit_tx: PwSender<Terminate>,
     pub terminate: Arc<AtomicBool>,
     pub size: Arc<Mutex<(u32, u32)>>,
-    pub sample_rate: Option<Arc<Mutex<i32>>>,
+    pub sample_rate: Option<Arc<Mutex<Option<i32>>>>,
 }
 
 impl fmt::Debug for PipewireSession {
@@ -108,7 +110,7 @@ impl PipewireSession {
         let fps = video.fps;
         let max_framerate = fps.filter(|fps| *fps > 0).unwrap_or(1000);
         let size = Arc::new(Mutex::new((0, 0)));
-        let sample_rate = audio.as_ref().map(|_audio| Arc::new(Mutex::new(0)));
+        let sample_rate = audio.as_ref().map(|_audio| Arc::new(Mutex::new(None)));
         let terminate = Arc::new(AtomicBool::new(false));
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         let (setup_tx, setup_rx) = crossbeam_channel::bounded::<Result<()>>(1);
@@ -122,11 +124,14 @@ impl PipewireSession {
             move || {
                 let run = || -> Result<()> {
                     let dbus = DbusScreen::new()?;
-                    let node_id = dbus.start(source_types)?;
+                    let session = dbus.start(source_types)?;
+                    let node_id = session.node_id;
 
                     let mainloop = MainLoopRc::new(None)?;
                     let context = ContextRc::new(&mainloop, None)?;
-                    let core = context.connect_rc(None)?;
+                    // The screencast node is only reachable on the remote the portal
+                    // granted; under a sandbox the default socket does not have it.
+                    let core = context.connect_fd_rc(session.fd, None)?;
 
                     let _quit_rx = quit_rx.attach(mainloop.loop_(), {
                         let mainloop = mainloop.clone();
@@ -150,6 +155,7 @@ impl PipewireSession {
                         format: VideoInfoRaw::new(),
                         size_guard: Some(size_guard),
                         size,
+                        setup_tx: Some(setup_tx.clone()),
                     };
 
                     let _video_listener = video_stream
@@ -204,8 +210,11 @@ impl PipewireSession {
                     )?;
 
                     let _audio = if let Some(a_tx) = a_tx {
+                        // Desktop audio is not a screencast node, so it needs the ordinary
+                        // connection rather than the portal's remote.
+                        let audio_core = context.connect_rc(None)?;
                         let audio_stream = StreamRc::new(
-                            core.clone(),
+                            audio_core.clone(),
                             "scrcap-audio",
                             properties! {
                                 *keys::MEDIA_TYPE => "Audio",
@@ -269,19 +278,20 @@ impl PipewireSession {
                         None
                     };
 
-                    let _ = setup_tx.send(Ok(()));
                     mainloop.run();
                     Ok(())
                 };
 
                 if let Err(e) = run() {
-                    let _ = setup_tx.send(Err(e));
+                    let _ = setup_tx.try_send(Err(e));
                 }
                 terminate.store(true, Ordering::Relaxed);
             }
         });
         drop(setup_tx);
 
+        // Every sender lives on the capture thread, so a session that dies before it
+        // negotiates closes the channel instead of reporting a size of (0, 0).
         match setup_rx.recv() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -293,8 +303,6 @@ impl PipewireSession {
                 return Err(CaptureError::WorkerGone);
             }
         }
-
-        let _ = *size.lock();
 
         Ok(PipewireSession {
             jh: Some(jh),
@@ -310,9 +318,7 @@ impl PipewireSession {
     }
 
     pub fn sample_rate(&self) -> Option<i32> {
-        self.sample_rate
-            .as_ref()
-            .map(|sample_rate| *sample_rate.lock())
+        self.sample_rate.as_ref().and_then(|rate| *rate.lock())
     }
 
     pub fn terminate(&self) {
@@ -481,6 +487,9 @@ fn video_param_change_callback(
     } else {
         *data.size.lock() = (size.width, size.height);
     }
+    if let Some(setup_tx) = data.setup_tx.take() {
+        let _ = setup_tx.try_send(Ok(()));
+    }
 }
 
 fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
@@ -494,6 +503,10 @@ fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
             if spa_buffer.n_datas >= 1 {
                 let sample_rate = data.format.rate();
                 let nb_channels = data.format.channels();
+                if sample_rate == 0 || nb_channels == 0 {
+                    stream.queue_raw_buffer(buffer);
+                    return;
+                }
                 let n_datas = spa_buffer.n_datas as usize;
                 // One plane per channel, all the same length, so the shortest readable one
                 // sets the frame's sample count rather than misaligning the planes after it.
@@ -548,7 +561,10 @@ fn audio_param_change_callback(
     if data.format.parse(param).is_err() {
         return;
     }
-    *data.sample_rate.lock() = data.format.rate() as i32;
+    let rate = data.format.rate() as i32;
+    if rate > 0 {
+        *data.sample_rate.lock() = Some(rate);
+    }
 }
 
 impl Drop for PipewireSession {

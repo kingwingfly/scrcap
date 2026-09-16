@@ -32,6 +32,7 @@ const HEIGHT: u32 = 720;
 impl CaptureConfig {
     /// Create a new capture configuration.
     pub fn create(self) -> Result<CaptureDesc> {
+        self.validate()?;
         let (tx, rx) = bounded(self.video.channel_capacity);
         let mut gate = FpsGate::new(self.video.fps);
         let control = Arc::new(AtomicBool::new(false));

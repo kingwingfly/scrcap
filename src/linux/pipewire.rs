@@ -33,7 +33,7 @@ use pipewire::{
         sys::{
             SPA_CHUNK_FLAG_CORRUPTED, SPA_META_Header, SPA_PARAM_META_size, SPA_PARAM_META_type,
             SPA_PARAM_Meta, SPA_TYPE_OBJECT_ParamMeta, SPA_VIDEO_FORMAT_BGRA, spa_buffer,
-            spa_meta_header,
+            spa_chunk, spa_data, spa_meta_header,
         },
         utils::{Direction, Fraction, SpaTypes},
     },
@@ -254,9 +254,13 @@ impl PipewireSession {
                             Pod::from_bytes(&meta)
                                 .ok_or_else(|| CaptureError::Portal("invalid meta pod".into()))?,
                         ];
+                        // No target: `node_id` is the portal's *video* node, and an audio
+                        // stream aimed at it can never link. `STREAM_CAPTURE_SINK` above is
+                        // what tells the session manager to pick the default sink monitor,
+                        // and an explicit target would override it.
                         audio_stream.connect(
                             Direction::Input,
-                            Some(node_id),
+                            None,
                             StreamFlags::AUTOCONNECT
                                 | StreamFlags::MAP_BUFFERS
                                 | StreamFlags::RT_PROCESS,
@@ -371,6 +375,24 @@ unsafe fn buffer_ts(buffer: *const spa_buffer) -> u64 {
     }
 }
 
+/// Start of a chunk's valid data and how many bytes of it are actually readable.
+///
+/// SPA defines `offset` modulo `maxsize` and only guarantees `size` up to the end of the
+/// mapped allocation, so a producer may hand over an offset past it. Returns `None` for an
+/// unmapped, empty or corrupt chunk.
+unsafe fn chunk_slice(plane: spa_data, chunk: &spa_chunk) -> Option<(*const u8, usize)> {
+    let maxsize = plane.maxsize as usize;
+    if plane.data.is_null() || maxsize == 0 || chunk.size == 0 {
+        return None;
+    }
+    if chunk.flags & SPA_CHUNK_FLAG_CORRUPTED as i32 != 0 {
+        return None;
+    }
+    let offset = chunk.offset as usize % maxsize;
+    let avail = (maxsize - offset).min(chunk.size as usize);
+    Some((unsafe { (plane.data as *const u8).add(offset) }, avail))
+}
+
 fn video_process_callback(stream: &Stream, data: &mut VideoData) {
     let buffer = unsafe { stream.dequeue_raw_buffer() };
     if buffer.is_null() {
@@ -391,11 +413,12 @@ fn video_process_callback(stream: &Stream, data: &mut VideoData) {
                     row_bytes
                 };
                 let height = size.height as usize;
-                let empty = chunk.size == 0
-                    || chunk.flags & SPA_CHUNK_FLAG_CORRUPTED as i32 != 0
-                    || (chunk.size as usize) < stride * height;
-                let base = ((*plane).data as *const u8).add(chunk.offset as usize);
-                let Some(vframe) = (if empty {
+                let want = stride.saturating_mul(height);
+                let Some((base, avail)) = chunk_slice(*plane, chunk) else {
+                    stream.queue_raw_buffer(buffer);
+                    return;
+                };
+                let Some(vframe) = (if want == 0 || avail < want {
                     None
                 } else {
                     pack_rows(base, stride, row_bytes, height)
@@ -470,25 +493,36 @@ fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
             if spa_buffer.n_datas >= 1 {
                 let sample_rate = data.format.rate();
                 let nb_channels = data.format.channels();
-                let nb_samples = (*(*spa_buffer.datas).chunk).size as usize / size_of::<f32>();
-                let mut aframe =
-                    Vec::with_capacity(nb_samples * nb_channels as usize * size_of::<f32>());
-                for i in 0..spa_buffer.n_datas as usize {
-                    let plane = spa_buffer.datas.add(i);
-                    let chunk = &*(*plane).chunk;
-                    aframe.extend_from_slice(core::slice::from_raw_parts(
-                        ((*plane).data as *const u8).add(chunk.offset as usize),
-                        chunk.size as usize,
-                    ));
+                let n_datas = spa_buffer.n_datas as usize;
+                // One plane per channel, all the same length, so the shortest readable one
+                // sets the frame's sample count rather than misaligning the planes after it.
+                let plane_bytes = (0..n_datas)
+                    .map(|i| {
+                        let plane = spa_buffer.datas.add(i);
+                        chunk_slice(*plane, &*(*plane).chunk).map_or(0, |(_, avail)| avail)
+                    })
+                    .min()
+                    .unwrap_or(0);
+                let nb_samples = plane_bytes / size_of::<f32>();
+                if nb_samples > 0 {
+                    let plane_bytes = nb_samples * size_of::<f32>();
+                    let mut aframe = Vec::with_capacity(plane_bytes * n_datas);
+                    for i in 0..n_datas {
+                        let plane = spa_buffer.datas.add(i);
+                        if let Some((base, _)) = chunk_slice(*plane, &*(*plane).chunk) {
+                            aframe
+                                .extend_from_slice(core::slice::from_raw_parts(base, plane_bytes));
+                        }
+                    }
+                    let _ = data.tx.try_send(AudioFrame {
+                        aframe,
+                        nb_samples: nb_samples as i32,
+                        sample_rate: sample_rate as i32,
+                        nb_channels: nb_channels as i32,
+                        sample_fmt: SampleFmt::F32P,
+                        ts: buffer_ts(spa_buffer),
+                    });
                 }
-                let _ = data.tx.try_send(AudioFrame {
-                    aframe,
-                    nb_samples: nb_samples as i32,
-                    sample_rate: sample_rate as i32,
-                    nb_channels: nb_channels as i32,
-                    sample_fmt: SampleFmt::F32P,
-                    ts: buffer_ts(spa_buffer),
-                });
             }
         }
         stream.queue_raw_buffer(buffer);

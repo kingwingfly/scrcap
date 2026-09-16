@@ -11,6 +11,7 @@ use crossbeam_channel::{Receiver, bounded};
 impl CaptureConfig {
     /// Spawns a thread to capture the screen and returns a `CaptureDesc` that can be used to control the capture.
     pub fn create(self) -> Result<CaptureDesc> {
+        self.validate()?;
         let (v_tx, v_rx) = bounded(self.video.channel_capacity);
         let (a_tx, a_rx) = match self.audio.as_ref() {
             Some(audio) => {

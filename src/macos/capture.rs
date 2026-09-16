@@ -24,12 +24,13 @@ use objc2::{
     runtime::{AnyClass, ProtocolObject},
     sel,
 };
-use objc2_app_kit::{NSView, NSWindow, NSWindowSharingType};
+use objc2_app_kit::NSView;
 use objc2_core_media::{CMTime, CMTimeFlags};
-use objc2_foundation::{NSArray, NSError, NSObjectProtocol as _};
+use objc2_foundation::{NSArray, NSError, NSNumber, NSObjectProtocol as _};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCContentSharingPicker, SCDisplay, SCShareableContent, SCStream,
-    SCStreamConfiguration, SCStreamConfigurationPreset, SCStreamOutputType, SCWindow,
+    SCContentFilter, SCContentSharingPicker, SCContentSharingPickerConfiguration, SCDisplay,
+    SCShareableContent, SCStream, SCStreamConfiguration, SCStreamConfigurationPreset,
+    SCStreamOutputType, SCWindow,
 };
 use parking_lot::Mutex;
 use regex::Regex;
@@ -38,11 +39,12 @@ use tracing::error;
 impl CaptureConfig {
     /// Spawns a thread to capture the screen and returns a `CaptureDesc` that can be used to control the capture.
     ///
-    /// `video.hide` touches `NSWindow`, which is main-thread-only, so when this is called
-    /// from anywhere else that work is sent to the main thread and waited on. The caller's
-    /// main thread therefore has to be running its loop -- the same thing `Target::Pick`
-    /// needs of it.
+    /// `video.hide` reads `NSView`/`NSWindow`, which are main-thread-only, so when this is
+    /// called from anywhere else that work is sent to the main thread and waited on. The
+    /// caller's main thread therefore has to be running its loop -- the same thing
+    /// `Target::Pick` needs of it.
     pub fn create(self) -> Result<CaptureDesc> {
+        self.validate()?;
         let re = match &self.video.target {
             Target::WindowName(pattern) => Some(
                 Regex::new(pattern)
@@ -65,26 +67,25 @@ impl CaptureConfig {
         let audio_desc = self.audio.as_ref().map(|_| CaptureAudioDesc {
             sample_rate: Arc::new(Mutex::new(0)),
         });
-        let mut hidden = Vec::new();
+        let mut excluded: Vec<u32> = Vec::new();
         if !self.video.hide.is_empty() {
             let views = &self.video.hide;
-            let hidden = &mut hidden;
-            let mut hide = move || {
-                for ns_window in views
-                    .iter()
-                    .filter_map(|ns_view| unsafe { Retained::retain(*ns_view as *mut NSView) })
-                    .filter_map(|ns_view| ns_view.window())
-                {
-                    let sharing_type = ns_window.sharingType();
-                    ns_window.setSharingType(NSWindowSharingType::None);
-                    // Raw pointer, not `Retained`, so the descriptor stays `Send`.
-                    hidden.push((Retained::into_raw(ns_window) as isize, sharing_type));
-                }
+            let excluded = &mut excluded;
+            let mut resolve = move || {
+                excluded.extend(
+                    views
+                        .iter()
+                        .filter_map(|ns_view| unsafe { Retained::retain(*ns_view as *mut NSView) })
+                        .filter_map(|ns_view| ns_view.window())
+                        // `windowNumber` is the `CGWindowID` ScreenCaptureKit filters on.
+                        .filter_map(|ns_window| u32::try_from(ns_window.windowNumber()).ok()),
+                );
             };
-            // `NSWindow` is main-thread-only, and `Target::Pick` forces `create` off it.
+            // `NSView`/`NSWindow` are main-thread-only, and `Target::Pick` forces `create`
+            // off it.
             match MainThreadMarker::new() {
-                Some(_) => hide(),
-                None => DispatchQueue::main().exec_sync(hide),
+                Some(_) => resolve(),
+                None => DispatchQueue::main().exec_sync(resolve),
             }
         }
 
@@ -102,7 +103,7 @@ impl CaptureConfig {
                 let (stop_tx, stop_rx) = bounded::<Option<String>>(1);
                 let run = || -> Result<(Retained<SCStream>, Retained<VideoStreamOutput>, bool)> {
                     let (filter, width, height) = if target == Target::Pick {
-                        present_picker()?
+                        present_picker(&excluded)?
                     } else {
                         let (target_tx, target_rx) = bounded(1);
                         let block = RcBlock::new(
@@ -123,6 +124,7 @@ impl CaptureConfig {
                                     &*shareable,
                                     &target,
                                     re.as_ref(),
+                                    &excluded,
                                 ));
                             },
                         );
@@ -142,7 +144,12 @@ impl CaptureConfig {
                     };
                     stream_config.setWidth(width);
                     stream_config.setHeight(height);
-                    stream_config.setCapturesAudio(self.audio.is_some());
+                    // macOS 13+; on 12.3 the selector is missing and sending it aborts.
+                    if stream_config.respondsToSelector(sel!(setCapturesAudio:)) {
+                        stream_config.setCapturesAudio(self.audio.is_some());
+                    } else if self.audio.is_some() {
+                        return Err(CaptureError::Unsupported);
+                    }
                     if stream_config.respondsToSelector(sel!(setCaptureMicrophone:)) {
                         stream_config.setCaptureMicrophone(false);
                     }
@@ -252,7 +259,6 @@ impl CaptureConfig {
         let _ = *size.lock(); // Guard in screen capture dropped -> capture started
         if let Err(e) = setup {
             let _ = jh.join();
-            restore_sharing_types(hidden);
             return Err(e);
         }
 
@@ -261,13 +267,13 @@ impl CaptureConfig {
             unparker,
             v_rx: Some(v_rx),
             a_rx,
-            video_desc: CaptureVideoDesc { size, hidden },
+            video_desc: CaptureVideoDesc { size },
             audio_desc,
         })
     }
 }
 
-unsafe fn present_picker() -> Result<(Retained<SCContentFilter>, usize, usize)> {
+unsafe fn present_picker(excluded: &[u32]) -> Result<(Retained<SCContentFilter>, usize, usize)> {
     unsafe {
         if AnyClass::get(c"SCContentSharingPicker").is_none() {
             return Err(CaptureError::Unsupported);
@@ -275,6 +281,12 @@ unsafe fn present_picker() -> Result<(Retained<SCContentFilter>, usize, usize)> 
         let (tx, rx) = bounded(1);
         let observer = PickerObserver::new(tx);
         let picker = SCContentSharingPicker::sharedPicker();
+        if !excluded.is_empty() {
+            let ids: Vec<_> = excluded.iter().copied().map(NSNumber::new_u32).collect();
+            let config = SCContentSharingPickerConfiguration::new();
+            config.setExcludedWindowIDs(&NSArray::from_retained_slice(&ids));
+            picker.setDefaultConfiguration(&config);
+        }
         picker.addObserver(ProtocolObject::from_ref(&*observer));
         picker.setActive(true);
         picker.present();
@@ -310,15 +322,21 @@ unsafe fn content_filter(
     shareable: &SCShareableContent,
     target: &Target,
     re: Option<&Regex>,
+    excluded: &[u32],
 ) -> Result<(Retained<SCContentFilter>, usize, usize)> {
     unsafe {
+        let excluded_windows: Vec<_> = shareable
+            .windows()
+            .iter()
+            .filter(|window| excluded.contains(&window.windowID()))
+            .collect();
         // Point size kept as a fallback: `filter_size` needs selectors older systems lack.
         let from_display = |display: &SCDisplay| {
             (
                 SCContentFilter::initWithDisplay_excludingWindows(
                     SCContentFilter::alloc(),
                     display,
-                    &NSArray::new(),
+                    &NSArray::from_retained_slice(&excluded_windows),
                 ),
                 (display.width() as usize, display.height() as usize),
             )
@@ -363,24 +381,6 @@ unsafe fn content_filter(
     }
 }
 
-fn restore_sharing_types(hidden: Vec<(isize, NSWindowSharingType)>) {
-    if hidden.is_empty() {
-        return;
-    }
-    // `NSWindow` is main-thread-only and `CaptureDesc` is `Send`, so a drop elsewhere hops.
-    if MainThreadMarker::new().is_none() {
-        DispatchQueue::main().exec_async(move || restore_sharing_types(hidden));
-        return;
-    }
-    for (ptr, sharing_type) in hidden {
-        // Retakes the reference `create` stored.
-        let window = unsafe { Retained::from_raw(ptr as *mut NSWindow) };
-        if let Some(window) = window {
-            window.setSharingType(sharing_type);
-        }
-    }
-}
-
 /// A description of the capture, including control and size.
 ///
 /// Drop this descriptor to terminate the capture and clean up resources.
@@ -397,19 +397,11 @@ pub struct CaptureDesc {
 #[derive(Debug)]
 struct CaptureVideoDesc {
     size: Arc<Mutex<(u32, u32)>>,
-    /// Owned `NSWindow` pointers, kept as `isize` so this stays `Send`.
-    hidden: Vec<(isize, NSWindowSharingType)>,
 }
 
 impl CaptureVideoDesc {
     fn size(&self) -> (u32, u32) {
         *self.size.lock()
-    }
-}
-
-impl Drop for CaptureVideoDesc {
-    fn drop(&mut self) {
-        restore_sharing_types(std::mem::take(&mut self.hidden));
     }
 }
 

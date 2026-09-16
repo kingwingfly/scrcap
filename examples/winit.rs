@@ -397,6 +397,11 @@ impl State {
     /// Start showing a capture, sizing the texture to it.
     fn attach(&mut self, capture_desc: CaptureDesc) {
         let (width, height) = capture_desc.size();
+        self.resize_texture(width, height);
+        self.capture_desc = Some(capture_desc);
+    }
+
+    fn resize_texture(&mut self, width: u32, height: u32) {
         self.diffuse_texture = Texture::from_bytes(
             &self.device,
             &self.queue,
@@ -409,7 +414,6 @@ impl State {
         self.diffuse_bind_group = self
             .diffuse_texture
             .bind_group(&self.device, &self.texture_bind_group_layout);
-        self.capture_desc = Some(capture_desc);
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -534,16 +538,15 @@ impl State {
             }
         };
         let VideoFrame { vframe, size, .. } = frame;
-        // The texture is sized in `attach` from `capture_desc.size()`; a frame of any other size
-        // would make `write_texture` panic on the extent check rather than render wrong.
+        // `write_texture` panics on an extent mismatch, and the source can resize mid-capture.
         if (size.0, size.1)
             != (
                 self.diffuse_texture.texture_size.width,
                 self.diffuse_texture.texture_size.height,
             )
         {
-            warn!("capture size changed to {size:?}, skipping frame");
-            return true;
+            info!("capture size changed to {size:?}");
+            self.resize_texture(size.0, size.1);
         }
         self.queue.write_texture(
             // Tells wgpu where to copy the pixel data

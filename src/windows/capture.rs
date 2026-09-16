@@ -27,7 +27,7 @@ use windows::{
             Direct3D11::{
                 D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-                D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Texture2D,
+                D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11Texture2D,
             },
             Dxgi::IDXGIDevice,
             Gdi::{EnumDisplayMonitors, HDC, HMONITOR, MONITOR_DEFAULTTONULL, MonitorFromPoint},
@@ -195,6 +195,13 @@ fn capture_item(target: Target) -> Result<GraphicsCaptureItem> {
     })
 }
 
+/// The WinRT wrapper `Direct3D11CaptureFramePool` takes around a D3D11 device. Built again
+/// where needed rather than shared, because it is not `Send`.
+fn winrt_device(d3d_device: &ID3D11Device) -> windows::core::Result<IDirect3DDevice> {
+    let dxgi_device: IDXGIDevice = d3d_device.cast()?;
+    unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)? }.cast()
+}
+
 fn restore_hidden(hidden: &[(isize, WINDOW_DISPLAY_AFFINITY)]) {
     for (hwnd, previous) in hidden {
         restore_window_capture_affinity(HWND(*hwnd as _), *previous);
@@ -272,9 +279,7 @@ impl VideoConfig {
                         )?;
                         let d3d_device = d3d_device.ok_or(Unsupported::Direct3D)?;
                         let d3d_device_context = d3d_device_context.ok_or(Unsupported::Direct3D)?;
-                        let dxgi_device: IDXGIDevice = d3d_device.cast()?;
-                        let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)?;
-                        let device: IDirect3DDevice = inspectable.cast()?;
+                        let device = winrt_device(&d3d_device)?;
 
                         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
                             &device,
@@ -283,7 +288,7 @@ impl VideoConfig {
                             item_size,
                         )?;
 
-                        let session = pool.CreateCaptureSession(&item)?; // I do not care if item size changed
+                        let session = pool.CreateCaptureSession(&item)?;
                         if let Some(fps) = fps.filter(|fps| *fps > 0)
                             && ApiInformation::IsPropertyPresent(
                                 &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
@@ -297,18 +302,34 @@ impl VideoConfig {
                         let terminate_c = terminate.clone();
                         let gate = Mutex::new(FpsGate::new(fps));
                         let staging: Mutex<Option<(ID3D11Texture2D, u32, u32)>> = Mutex::new(None);
+                        let pool_size = Mutex::new(item_size);
                         let token = pool.FrameArrived(&TypedEventHandler::<
                             Direct3D11CaptureFramePool,
                             IInspectable,
                         >::new(
-                            move |frame, _| {
+                            move |pool, _| {
                                 if terminate_c.load(Ordering::Relaxed) {
                                     return Ok(());
                                 }
-                                let Some(frame) = frame.as_ref() else {
+                                let Some(pool) = pool.as_ref() else {
                                     return Ok(());
                                 };
-                                let frame = frame.TryGetNextFrame()?;
+                                let frame = pool.TryGetNextFrame()?;
+                                // The pool keeps handing out textures of the size it was made
+                                // with, clipping or padding a source that has since resized.
+                                let content = frame.ContentSize()?;
+                                let mut pool_size = pool_size.lock();
+                                if content.Width > 0 && content.Height > 0 && content != *pool_size
+                                {
+                                    pool.Recreate(
+                                        &winrt_device(&d3d_device)?,
+                                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                        3,
+                                        content,
+                                    )?;
+                                    *pool_size = content;
+                                }
+                                drop(pool_size);
                                 let ts = frame
                                     .SystemRelativeTime()
                                     .ok()
@@ -322,7 +343,6 @@ impl VideoConfig {
                                 let texture = interface.GetInterface::<ID3D11Texture2D>()?;
                                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                                 texture.GetDesc(&mut desc);
-                                *size.lock() = (desc.Width, desc.Height);
 
                                 let mut staging = staging.lock();
                                 let cpu_texture = match staging.as_ref() {
@@ -355,6 +375,7 @@ impl VideoConfig {
                                         })?;
                                         *staging =
                                             Some((cpu_texture.clone(), desc.Width, desc.Height));
+                                        *size.lock() = (desc.Width, desc.Height);
                                         cpu_texture
                                     }
                                 };

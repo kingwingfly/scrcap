@@ -42,7 +42,7 @@ impl CaptureConfig {
             .spawn(move || {
                 let start = Instant::now();
                 let mut rng = SmallRng::from_seed([42; 32]);
-                let num_pixel = WIDTH as usize * HEIGHT as usize * 4;
+                let num_bytes = WIDTH as usize * HEIGHT as usize * 4;
                 loop {
                     if control_.load(Ordering::Relaxed) {
                         break;
@@ -56,7 +56,7 @@ impl CaptureConfig {
                         thread::sleep(Duration::from_millis(1));
                         continue;
                     }
-                    let vframe = repeat_with(|| rng.random()).take(num_pixel).collect();
+                    let vframe = repeat_with(|| rng.random()).take(num_bytes).collect();
                     let _ = tx.try_send(VideoFrame {
                         vframe,
                         size: (WIDTH, HEIGHT),

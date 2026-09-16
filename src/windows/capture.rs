@@ -515,6 +515,167 @@ unsafe fn wasapi_sample_fmt(format: *const WAVEFORMATEX) -> Option<SampleFmt> {
     }
 }
 
+/// This thread's COM apartment, left on drop.
+struct ComApartment;
+
+impl ComApartment {
+    fn enter() -> Result<Self> {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
+/// A started WASAPI loopback capture of the default render device.
+struct Loopback {
+    audio_client: IAudioClient,
+    capture_client: IAudioCaptureClient,
+    sample_rate: i32,
+    nb_channels: i32,
+    sample_fmt: SampleFmt,
+    /// One sample of every channel.
+    frame_bytes: usize,
+    buffer_frames: u32,
+    // Must stay last: fields drop in order, and the interfaces above have to be released
+    // while their apartment still exists.
+    _com: ComApartment,
+}
+
+impl Loopback {
+    fn start() -> Result<Self> {
+        let com = ComApartment::enter()?;
+        unsafe {
+            let device_enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator as *const _, None, CLSCTX_ALL)?;
+            let device = device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+            let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+            let format = audio_client.GetMixFormat()?;
+            let sample_fmt = wasapi_sample_fmt(format);
+            let (sample_rate, nb_channels, bits_per_sample) = (
+                (*format).nSamplesPerSec as i32,
+                (*format).nChannels as i32,
+                (*format).wBitsPerSample as usize,
+            );
+            let init = audio_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                10_000_000, // 10_000_000 * 100ns = 1s
+                0,
+                format,
+                None,
+            );
+            CoTaskMemFree(Some(format as *const _));
+            init?;
+            let sample_fmt = sample_fmt.ok_or(Unsupported::SampleFormat)?;
+            let buffer_frames = audio_client.GetBufferSize()?;
+            let capture_client: IAudioCaptureClient = audio_client.GetService()?;
+            audio_client.Start()?;
+            Ok(Self {
+                audio_client,
+                capture_client,
+                sample_rate,
+                nb_channels,
+                sample_fmt,
+                frame_bytes: nb_channels as usize * (bits_per_sample / 8),
+                buffer_frames,
+                _com: com,
+            })
+        }
+    }
+
+    /// Deliver audio until `terminate` is set, the consumer hangs up, or WASAPI fails.
+    fn pump(
+        &self,
+        tx: &Sender<AudioFrame>,
+        wake_rx: &Receiver<()>,
+        terminate: &AtomicBool,
+    ) -> Result<()> {
+        let poll = Duration::from_nanos(
+            1_000_000_000 * self.buffer_frames as u64 / self.sample_rate as u64 / 2,
+        )
+        .min(Duration::from_millis(10));
+        // U8 PCM is offset binary: its zero point is 128, not 0.
+        let silence = match self.sample_fmt {
+            SampleFmt::U8 => 128u8,
+            _ => 0,
+        };
+        let poll_bytes = (self.sample_rate as u64 * poll.as_nanos() as u64 / 1_000_000_000 + 1)
+            as usize
+            * self.frame_bytes;
+        let mut data: *mut u8 = core::ptr::null_mut();
+        let mut nb_frames = 0u32;
+        let mut flags = 0u32;
+        let mut qpc = 0u64;
+        let mut next_ts = qpc_now();
+        while !terminate.load(Ordering::Relaxed) {
+            match wake_rx.recv_timeout(poll) {
+                Err(RecvTimeoutError::Timeout) => {}
+                _ => break,
+            }
+            let mut aframe = Vec::with_capacity(poll_bytes);
+            let mut nb_samples = 0u32;
+            let mut ts = None;
+            while unsafe { self.capture_client.GetNextPacketSize()? } != 0 {
+                unsafe {
+                    self.capture_client.GetBuffer(
+                        &mut data as *mut _,
+                        &mut nb_frames as *mut _,
+                        &mut flags as *mut _,
+                        None,
+                        Some(&mut qpc),
+                    )?;
+                }
+                ts.get_or_insert(qpc * 100);
+                let packet_bytes = nb_frames as usize * self.frame_bytes;
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
+                    aframe.extend_from_slice(unsafe {
+                        core::slice::from_raw_parts(data, packet_bytes)
+                    });
+                } else {
+                    aframe.resize(aframe.len() + packet_bytes, silence);
+                }
+                nb_samples += nb_frames;
+                unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
+            }
+            if aframe.is_empty() {
+                let gap = qpc_now().saturating_sub(next_ts);
+                nb_samples = (gap as u128 * self.sample_rate as u128 / 1_000_000_000)
+                    .min(self.sample_rate as u128) as u32;
+                if nb_samples == 0 {
+                    continue;
+                }
+                aframe.resize(nb_samples as usize * self.frame_bytes, silence);
+                ts = Some(next_ts);
+            }
+            let ts = ts.map_or(next_ts, |ts| ts.max(next_ts));
+            next_ts = ts + (nb_samples as u128 * 1_000_000_000 / self.sample_rate as u128) as u64;
+            match tx.try_send(AudioFrame {
+                aframe,
+                nb_samples: nb_samples as i32,
+                sample_rate: self.sample_rate,
+                nb_channels: self.nb_channels,
+                sample_fmt: self.sample_fmt,
+                ts,
+            }) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => terminate.store(true, Ordering::Relaxed),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Loopback {
+    fn drop(&mut self) {
+        let _ = unsafe { self.audio_client.Stop() };
+    }
+}
+
 impl AudioConfig {
     fn create(
         self,
@@ -524,179 +685,24 @@ impl AudioConfig {
         let sample_rate = Arc::new(Mutex::new(0));
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let (setup_tx, setup_rx) = bounded::<Result<()>>(1);
-        let desc_terminate = terminate.clone();
-        let jh = thread::spawn(unsafe {
+        let jh = thread::spawn({
             let sample_rate = sample_rate.clone();
-            let mut sample_rate_guard = sample_rate.lock_arc();
-            let setup_tx = setup_tx.clone();
-            move || -> Result<()> {
-                let com = CoInitializeEx(None, COINIT_MULTITHREADED);
-                if com.is_err() {
-                    let _ = setup_tx.send(Err(CaptureError::Win(com.into())));
-                    return Ok(());
-                }
-                let result = (|| -> Result<(
-                    IAudioClient,
-                    IAudioCaptureClient,
-                    i32,
-                    i32,
-                    usize,
-                    SampleFmt,
-                    u32,
-                )> {
-                    let device_enumerator: IMMDeviceEnumerator =
-                        CoCreateInstance(&MMDeviceEnumerator as *const _, None, CLSCTX_ALL)?;
-                    let device = device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-                    let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
-                    let format = audio_client.GetMixFormat()?;
-                    let sample_fmt = wasapi_sample_fmt(format);
-                    let (sample_rate, nb_channels, sample_size) = (
-                        (*format).nSamplesPerSec as i32,
-                        (*format).nChannels as i32,
-                        (*format).wBitsPerSample as usize / 8,
-                    );
-                    let init = audio_client.Initialize(
-                        AUDCLNT_SHAREMODE_SHARED,
-                        AUDCLNT_STREAMFLAGS_LOOPBACK,
-                        10_000_000, // 10_000_000 * 100ns = 1s
-                        0,
-                        format,
-                        None,
-                    );
-                    CoTaskMemFree(Some(format as *const _));
-                    init?;
-                    let Some(sample_fmt) = sample_fmt else {
-                        return Err(Unsupported::SampleFormat.into());
-                    };
-
-                    let buffer_frames = audio_client.GetBufferSize()?; // 1 frame = nb_channels(samples)
-                    let capture_client: IAudioCaptureClient = audio_client.GetService()?;
-                    audio_client.Start()?;
-                    Ok((
-                        audio_client,
-                        capture_client,
-                        sample_rate,
-                        nb_channels,
-                        sample_size,
-                        sample_fmt,
-                        buffer_frames,
-                    ))
-                })();
-
-                let (
-                    audio_client,
-                    capture_client,
-                    sample_rate,
-                    nb_channels,
-                    sample_size,
-                    sample_fmt,
-                    buffer_frames,
-                ) = match result {
-                    Ok(v) => v,
+            let terminate = terminate.clone();
+            move || {
+                let loopback = match Loopback::start() {
+                    Ok(loopback) => loopback,
                     Err(e) => {
-                        drop(sample_rate_guard);
                         let _ = setup_tx.send(Err(e));
-                        CoUninitialize();
-                        return Ok(());
+                        return;
                     }
                 };
-
-                *sample_rate_guard = sample_rate;
-                drop(sample_rate_guard); // release the lock
+                *sample_rate.lock() = loopback.sample_rate;
                 let _ = setup_tx.send(Ok(()));
-
-                let poll = Duration::from_nanos(
-                    1_000_000_000 * buffer_frames as u64 / sample_rate as u64 / 2,
-                )
-                .min(Duration::from_millis(10));
-                let frame_bytes = nb_channels as usize * sample_size;
-                // U8 PCM is offset binary: its zero point is 128, not 0.
-                let silence = match sample_fmt {
-                    SampleFmt::U8 => 128u8,
-                    _ => 0,
-                };
-                let poll_bytes = (sample_rate as u64 * poll.as_nanos() as u64 / 1_000_000_000 + 1)
-                    as usize
-                    * frame_bytes;
-                let mut data: *mut u8 = core::ptr::null_mut();
-                let mut nb_frames = 0u32;
-                let mut flags = 0u32;
-                let mut qpc = 0u64;
-                let mut next_ts = qpc_now();
-                // Wrapped so that a mid-capture failure still stops the client and balances
-                // the `CoInitializeEx` above instead of leaking the apartment.
-                let mut pump = || -> Result<()> {
-                    while !terminate.load(Ordering::Relaxed) {
-                        match wake_rx.recv_timeout(poll) {
-                            Err(RecvTimeoutError::Timeout) => {}
-                            _ => break,
-                        }
-                        let mut aframe = Vec::with_capacity(poll_bytes);
-                        let mut nb_samples = 0u32;
-                        let mut ts = None;
-                        while capture_client.GetNextPacketSize()? != 0 {
-                            capture_client.GetBuffer(
-                                &mut data as *mut _,
-                                &mut nb_frames as *mut _,
-                                &mut flags as *mut _,
-                                None,
-                                Some(&mut qpc),
-                            )?;
-                            ts.get_or_insert(qpc * 100);
-                            let packet_bytes = nb_frames as usize * frame_bytes;
-                            if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
-                                aframe.extend_from_slice(core::slice::from_raw_parts(
-                                    data,
-                                    packet_bytes,
-                                ));
-                            } else {
-                                aframe.resize(aframe.len() + packet_bytes, silence);
-                            }
-                            nb_samples += nb_frames;
-                            capture_client.ReleaseBuffer(nb_frames)?;
-                        }
-                        if aframe.is_empty() {
-                            let gap = qpc_now().saturating_sub(next_ts);
-                            nb_samples = (gap as u128 * sample_rate as u128 / 1_000_000_000)
-                                .min(sample_rate as u128)
-                                as u32;
-                            if nb_samples == 0 {
-                                continue;
-                            }
-                            aframe.resize(nb_samples as usize * frame_bytes, silence);
-                            ts = Some(next_ts);
-                        }
-                        let ts = ts.map_or(next_ts, |ts| ts.max(next_ts));
-                        next_ts =
-                            ts + (nb_samples as u128 * 1_000_000_000 / sample_rate as u128) as u64;
-                        match tx.try_send(AudioFrame {
-                            aframe,
-                            nb_samples: nb_samples as i32,
-                            sample_rate,
-                            nb_channels,
-                            sample_fmt,
-                            ts,
-                        }) {
-                            Ok(()) | Err(TrySendError::Full(_)) => {}
-                            Err(TrySendError::Disconnected(_)) => {
-                                terminate.store(true, Ordering::Relaxed)
-                            }
-                        }
-                    }
-                    Ok(())
-                };
-                let pumped = pump();
-                let stopped = audio_client.Stop();
-                CoUninitialize();
-                if let Err(e) = &pumped {
+                if let Err(e) = loopback.pump(&tx, &wake_rx, &terminate) {
                     error!("audio capture stopped: {e}");
                 }
-                pumped?;
-                stopped?;
-                Ok(())
             }
         });
-        drop(setup_tx);
 
         match setup_rx.recv() {
             Ok(Ok(())) => {}
@@ -709,12 +715,11 @@ impl AudioConfig {
                 return Err(CaptureError::WorkerGone);
             }
         }
-        let _ = *sample_rate.lock();
         Ok(CaptureAudioDesc {
             sample_rate,
             jh: Some(jh),
             wake_tx,
-            terminate: desc_terminate,
+            terminate,
         })
     }
 }
@@ -769,7 +774,7 @@ impl Drop for CaptureVideoDesc {
 #[derive(Debug)]
 struct CaptureAudioDesc {
     sample_rate: Arc<Mutex<i32>>,
-    jh: Option<JoinHandle<Result<()>>>,
+    jh: Option<JoinHandle<()>>,
     wake_tx: Sender<()>,
     terminate: Arc<AtomicBool>,
 }

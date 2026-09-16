@@ -80,6 +80,7 @@ use crate::{
 impl CaptureConfig {
     /// Create a new capture configuration.
     pub fn create(self) -> Result<CaptureDesc> {
+        self.validate()?;
         let (v_tx, v_rx) = bounded(self.video.channel_capacity);
         let terminate = Arc::new(AtomicBool::new(false));
         let video_desc = self.video.create(v_tx, terminate.clone())?;
@@ -617,6 +618,11 @@ impl AudioConfig {
                 )
                 .min(Duration::from_millis(10));
                 let frame_bytes = nb_channels as usize * sample_size;
+                // U8 PCM is offset binary: its zero point is 128, not 0.
+                let silence = match sample_fmt {
+                    SampleFmt::U8 => 128u8,
+                    _ => 0,
+                };
                 let poll_bytes = (sample_rate as u64 * poll.as_nanos() as u64 / 1_000_000_000 + 1)
                     as usize
                     * frame_bytes;
@@ -652,7 +658,7 @@ impl AudioConfig {
                                     packet_bytes,
                                 ));
                             } else {
-                                aframe.resize(aframe.len() + packet_bytes, 0);
+                                aframe.resize(aframe.len() + packet_bytes, silence);
                             }
                             nb_samples += nb_frames;
                             capture_client.ReleaseBuffer(nb_frames)?;
@@ -665,7 +671,7 @@ impl AudioConfig {
                             if nb_samples == 0 {
                                 continue;
                             }
-                            aframe.resize(nb_samples as usize * frame_bytes, 0);
+                            aframe.resize(nb_samples as usize * frame_bytes, silence);
                             ts = Some(next_ts);
                         }
                         let ts = ts.map_or(next_ts, |ts| ts.max(next_ts));

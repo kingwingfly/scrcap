@@ -34,7 +34,7 @@ impl PixFmt {
             Self::Abgr => 27,
             Self::Bgra => 28,
             Self::Rgb0 => 119,
-            Self::Bgr0 => 123,
+            Self::Bgr0 => 121,
         }
     }
 
@@ -46,7 +46,7 @@ impl PixFmt {
             27 => Some(Self::Abgr),
             28 => Some(Self::Bgra),
             119 => Some(Self::Rgb0),
-            123 => Some(Self::Bgr0),
+            121 => Some(Self::Bgr0),
             _ => None,
         }
     }

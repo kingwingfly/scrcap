@@ -1,5 +1,7 @@
 //! Capture configuration
 
+use crate::error::{CaptureError, Result};
+
 /// Configuration for the capture process.
 #[derive(Debug)]
 pub struct CaptureConfig {
@@ -9,18 +11,35 @@ pub struct CaptureConfig {
     pub audio: Option<AudioConfig>,
 }
 
+impl CaptureConfig {
+    /// Reject a configuration no backend can honour, before anything is started.
+    pub(crate) fn validate(&self) -> Result<()> {
+        // Every backend sends with `try_send`, which on a rendezvous channel only succeeds
+        // while a consumer happens to be parked in `recv`, so a capacity of 0 would drop
+        // almost everything instead of buffering it.
+        let zero = self.video.channel_capacity == 0
+            || self.audio.as_ref().is_some_and(|a| a.channel_capacity == 0);
+        if zero {
+            return Err(CaptureError::InvalidConfig(
+                "channel_capacity must be at least 1".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for the capture video.
 #[derive(Debug)]
 pub struct VideoConfig {
-    /// Capacity of the channel carrying video frames.
+    /// Capacity of the channel carrying video frames, at least 1.
     ///
     /// Video and audio get a channel each: a frame is orders of magnitude larger than an
     /// audio buffer, and dropping one is cheap where dropping audio is not.
     pub channel_capacity: usize,
     /// The window id to hide from capture:
     /// - Windows: HWND
-    /// - macOS: NSView ptr. Hiding is done on the main thread, so that thread must be
-    ///   running its loop if `create` is called from anywhere else.
+    /// - macOS: NSView ptr, resolved to its window's `CGWindowID` on the main thread, so
+    ///   that thread must be running its loop if `create` is called from anywhere else.
     /// - Linux: unsupported, a non-empty list is [`CaptureError::Unsupported`]. Neither
     ///   Wayland nor X11 lets a client opt a window out of a screencast.
     ///
@@ -48,7 +67,7 @@ pub struct VideoConfig {
 /// Configuration for the capture audio.
 #[derive(Debug)]
 pub struct AudioConfig {
-    /// Capacity of the channel carrying audio frames.
+    /// Capacity of the channel carrying audio frames, at least 1.
     ///
     /// Worth setting far deeper than the video one: audio frames are small, and a gap is an
     /// audible artefact rather than a frame the encoder can stretch over.

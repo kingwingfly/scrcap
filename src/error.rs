@@ -32,6 +32,8 @@ pub enum CaptureError {
     TargetNotFound,
     #[error("The capture target is not usable: {0}")]
     InvalidTarget(String),
+    #[error("The capture configuration is not usable: {0}")]
+    InvalidConfig(String),
     #[error("The capture thread terminated unexpectedly.")]
     WorkerGone,
 }

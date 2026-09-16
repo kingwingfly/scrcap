@@ -1,8 +1,13 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crossbeam_channel::Sender;
 use crossbeam_utils::sync::Unparker;
-use objc2::{AnyThread as _, DefinedClass as _, define_class, msg_send, rc::Retained};
+use objc2::{
+    AnyThread as _, DefinedClass as _, Message as _, define_class, msg_send, rc::Retained,
+};
 use objc2_core_audio_types::{
     AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsFloat,
     kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
@@ -18,11 +23,15 @@ use objc2_core_video::{
     CVPixelBufferUnlockBaseAddress, kCVReturnSuccess,
 };
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
-use objc2_screen_capture_kit::{SCStream, SCStreamDelegate, SCStreamOutput, SCStreamOutputType};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver, SCStream,
+    SCStreamDelegate, SCStreamOutput, SCStreamOutputType,
+};
 use parking_lot::Mutex;
 use tracing::error;
 
 use crate::{
+    error::{CaptureError, Result},
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
@@ -274,6 +283,12 @@ impl VideoStreamOutput {
 #[derive(Debug)]
 pub(crate) struct StreamDelegateIvars {
     unparker: Unparker,
+    /// Set before unparking, so the worker knows the stream is already stopped and must not
+    /// ask it to stop again.
+    stopped: Arc<AtomicBool>,
+    /// Also answers the worker's stop wait, so that wait is satisfied whether the worker
+    /// stopped the stream or the stream stopped itself first.
+    stop_tx: Sender<Option<String>>,
 }
 
 define_class!(
@@ -289,15 +304,78 @@ define_class!(
         #[unsafe(method(stream:didStopWithError:))]
         unsafe fn stream_didStopWithError(&self, _stream: &SCStream, e: &NSError) {
             error!("stream stopped: {e}");
+            self.ivars().stopped.store(true, Ordering::Release);
+            let _ = self.ivars().stop_tx.try_send(None);
             self.ivars().unparker.unpark();
         }
     }
 );
 
 impl StreamDelegate {
-    pub(crate) fn new(unparker: Unparker) -> Retained<Self> {
+    pub(crate) fn new(
+        unparker: Unparker,
+        stopped: Arc<AtomicBool>,
+        stop_tx: Sender<Option<String>>,
+    ) -> Retained<Self> {
         unsafe {
-            let this = Self::alloc().set_ivars(StreamDelegateIvars { unparker });
+            let this = Self::alloc().set_ivars(StreamDelegateIvars {
+                unparker,
+                stopped,
+                stop_tx,
+            });
+            msg_send![super(this), init]
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PickerObserverIvars {
+    tx: Sender<Result<Retained<SCContentFilter>>>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[ivars = PickerObserverIvars]
+    #[derive(Debug)]
+    pub(crate) struct PickerObserver;
+
+    unsafe impl NSObjectProtocol for PickerObserver {}
+
+    #[allow(non_snake_case)]
+    unsafe impl SCContentSharingPickerObserver for PickerObserver {
+        #[unsafe(method(contentSharingPicker:didUpdateWithFilter:forStream:))]
+        unsafe fn contentSharingPicker_didUpdateWithFilter_forStream(
+            &self,
+            _picker: &SCContentSharingPicker,
+            filter: &SCContentFilter,
+            _stream: Option<&SCStream>,
+        ) {
+            let _ = self.ivars().tx.try_send(Ok(filter.retain()));
+        }
+
+        #[unsafe(method(contentSharingPicker:didCancelForStream:))]
+        unsafe fn contentSharingPicker_didCancelForStream(
+            &self,
+            _picker: &SCContentSharingPicker,
+            _stream: Option<&SCStream>,
+        ) {
+            let _ = self.ivars().tx.try_send(Err(CaptureError::TargetNotFound));
+        }
+
+        #[unsafe(method(contentSharingPickerStartDidFailWithError:))]
+        unsafe fn contentSharingPickerStartDidFailWithError(&self, error: &NSError) {
+            let _ = self
+                .ivars()
+                .tx
+                .try_send(Err(CaptureError::ScreenCaptureKit(error.to_string())));
+        }
+    }
+);
+
+impl PickerObserver {
+    pub(crate) fn new(tx: Sender<Result<Retained<SCContentFilter>>>) -> Retained<Self> {
+        unsafe {
+            let this = Self::alloc().set_ivars(PickerObserverIvars { tx });
             msg_send![super(this), init]
         }
     }

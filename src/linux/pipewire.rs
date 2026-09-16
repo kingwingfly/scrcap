@@ -10,6 +10,7 @@ use std::{
 };
 
 use crossbeam_channel::Sender;
+use tracing::error;
 
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use pipewire::{
@@ -35,7 +36,7 @@ use pipewire::{
         },
         utils::{Direction, Fraction, SpaTypes},
     },
-    stream::{Stream, StreamFlags, StreamRc},
+    stream::{Stream, StreamFlags, StreamRc, StreamState},
 };
 
 use crate::{
@@ -52,6 +53,7 @@ struct Terminate;
 
 struct VideoData {
     tx: Sender<VideoFrame>,
+    mainloop: MainLoopRc,
     gate: FpsGate,
     format: VideoInfoRaw,
     size_guard: Option<ArcMutexGuard<RawMutex, (u32, u32)>>,
@@ -89,6 +91,10 @@ impl PipewireSession {
         video: VideoConfig,
         audio: Option<AudioConfig>,
     ) -> Result<Self> {
+        if !video.hide.is_empty() {
+            // Neither Wayland nor X11 lets a client opt a window out of a screencast.
+            return Err(CaptureError::Unsupported);
+        }
         let source_types = match video.target {
             Target::Pick => 0, // every available source type
             Target::Primary | Target::Monitor(_) => SOURCE_TYPE_MONITOR,
@@ -135,6 +141,7 @@ impl PipewireSession {
 
                     let video_data = VideoData {
                         tx: v_tx,
+                        mainloop: mainloop.clone(),
                         gate: FpsGate::new(fps),
                         format: VideoInfoRaw::new(),
                         size_guard: Some(size_guard),
@@ -145,6 +152,7 @@ impl PipewireSession {
                         .add_local_listener_with_user_data(video_data)
                         .param_changed(video_param_change_callback)
                         .process(video_process_callback)
+                        .state_changed(video_state_change_callback)
                         .register()?;
 
                     let obj = object! {
@@ -371,15 +379,29 @@ fn video_process_callback(stream: &Stream, data: &mut VideoData) {
             let spa_buffer = &*(*buffer).buffer;
             let ts = buffer_ts(spa_buffer);
             if spa_buffer.n_datas >= 1 && data.gate.allow(ts) {
-                let vframe = {
-                    let data = spa_buffer.datas; // first elem
-                    std::slice::from_raw_parts(
-                        (*data).data as *const u8,
-                        (*(*data).chunk).size as usize,
-                    )
-                    .to_vec()
-                };
                 let size = data.format.size();
+                let plane = spa_buffer.datas; // first elem
+                let chunk = &*(*plane).chunk;
+                let row_bytes = size.width as usize * 4;
+                let stride = chunk.stride as usize;
+                let height = size.height as usize;
+                // The producer may pad rows, but `size` promises width*height*4.
+                let vframe = if stride == row_bytes || chunk.stride <= 0 {
+                    std::slice::from_raw_parts((*plane).data as *const u8, chunk.size as usize)
+                        .to_vec()
+                } else if stride < row_bytes || stride * height > chunk.size as usize {
+                    stream.queue_raw_buffer(buffer);
+                    return;
+                } else {
+                    let padded =
+                        std::slice::from_raw_parts((*plane).data as *const u8, stride * height);
+                    let mut packed = Vec::with_capacity(row_bytes * height);
+                    for row in 0..height {
+                        let start = row * stride;
+                        packed.extend_from_slice(&padded[start..start + row_bytes]);
+                    }
+                    packed
+                };
                 let _ = data.tx.try_send(VideoFrame {
                     vframe,
                     size: (size.width, size.height),
@@ -389,6 +411,24 @@ fn video_process_callback(stream: &Stream, data: &mut VideoData) {
             }
         }
         stream.queue_raw_buffer(buffer);
+    }
+}
+
+/// Leave the loop when the stream ends on its own, so the senders drop and a consumer's
+/// `recv` reports that the capture is over instead of blocking forever.
+fn video_state_change_callback(
+    _stream: &Stream,
+    data: &mut VideoData,
+    _old: StreamState,
+    new: StreamState,
+) {
+    match new {
+        StreamState::Error(e) => {
+            error!("pipewire stream error: {e}");
+            data.mainloop.quit();
+        }
+        StreamState::Unconnected => data.mainloop.quit(),
+        _ => {}
     }
 }
 

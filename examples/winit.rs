@@ -1,18 +1,16 @@
 //! This example use `wgpu` to display the captured frames (For test only).
 
-use std::sync::Arc;
+use std::{sync::Arc, thread, time::Duration};
 
 use anyhow::Result;
+use crossbeam_channel::{Receiver, TryRecvError, bounded};
 use log::{error, info, warn};
-use wgpu::{
-    CurrentSurfaceTexture,
-    rwh::{HasWindowHandle, RawWindowHandle},
-    util::DeviceExt as _,
-};
+use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+use wgpu::{CurrentSurfaceTexture, util::DeviceExt as _};
 use winit::{
     application::ApplicationHandler,
     event::{KeyEvent, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId, WindowLevel},
 };
@@ -72,6 +70,8 @@ const INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
 #[derive(Debug, Default)]
 struct App {
     state: Option<State>,
+    /// The window, and the capture being built for it on another thread.
+    pending: Option<(Window, Receiver<scrcap::error::Result<CaptureDesc>>)>,
 }
 
 impl ApplicationHandler for App {
@@ -79,9 +79,71 @@ impl ApplicationHandler for App {
         let window = event_loop
             .create_window(Window::default_attributes().with_window_level(WindowLevel::AlwaysOnTop))
             .expect("Window should be created");
-        let state = pollster::block_on(State::new(window)).expect("State should be initialized");
-        state.window.request_redraw();
-        self.state = Some(state);
+
+        let raw = window.window_handle().map(|handle| handle.as_raw());
+        let mut hide = vec![];
+        if let Ok(handle) = raw {
+            match handle {
+                RawWindowHandle::AppKit(handle) => hide.push(handle.ns_view.as_ptr() as isize),
+                RawWindowHandle::Win32(handle) => hide.push(handle.hwnd.get()),
+                _ => {}
+            }
+        }
+
+        // `Target::Pick` blocks `create` until the user chooses, and on Windows and macOS the
+        // picker answers on this very thread, so `create` has to run somewhere else.
+        #[cfg(target_os = "windows")]
+        let target = Target::Pick(match raw {
+            Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
+            _ => panic!("the picker needs a Win32 window to present from"),
+        });
+        #[cfg(not(target_os = "windows"))]
+        let target = Target::Pick;
+
+        let (tx, rx) = bounded(1);
+        thread::spawn(move || {
+            let _ = tx.send(
+                CaptureConfig {
+                    video: VideoConfig {
+                        channel_capacity: 2,
+                        hide,
+                        target,
+                        fps: Some(60),
+                    },
+                    audio: None,
+                }
+                .create(),
+            );
+        });
+        event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(50)));
+        self.pending = Some((window, rx));
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some((_, rx)) = self.pending.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(capture_desc)) => {
+                let (window, _) = self.pending.take().expect("pending was just observed");
+                let state = pollster::block_on(State::new(window, capture_desc))
+                    .expect("State should be initialized");
+                state.window.request_redraw();
+                self.state = Some(state);
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Ok(Err(e)) => {
+                error!("failed to start the capture: {e}");
+                event_loop.exit();
+            }
+            Err(TryRecvError::Empty) => {
+                event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(50)));
+            }
+            Err(TryRecvError::Disconnected) => {
+                error!("the capture thread went away");
+                event_loop.exit();
+            }
+        }
     }
 
     fn window_event(
@@ -97,7 +159,11 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
-            WindowEvent::RedrawRequested => state.render(),
+            WindowEvent::RedrawRequested => {
+                if !state.render() {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -130,7 +196,7 @@ struct State {
 }
 
 impl State {
-    async fn new(window: Window) -> Result<Self> {
+    async fn new(window: Window, capture_desc: CaptureDesc) -> Result<Self> {
         let window = Arc::new(window);
         let size = window.inner_size();
 
@@ -183,24 +249,6 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
-        let mut hide = vec![];
-        if let Ok(Some(handle)) = window.window_handle().map(|wh| match wh.as_raw() {
-            RawWindowHandle::AppKit(handle) => Some(handle.ns_view.as_ptr() as isize),
-            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
-            _ => None,
-        }) {
-            hide.push(handle);
-        }
-        let capture_desc = CaptureConfig {
-            video: VideoConfig {
-                channel_capacity: 2,
-                hide,
-                target: Target::Primary,
-                fps: Some(60),
-            },
-            audio: None,
-        }
-        .create()?;
         let (width, height) = capture_desc.size();
 
         let diffuse_texture = Texture::from_bytes(
@@ -314,13 +362,19 @@ impl State {
             usage: wgpu::BufferUsages::INDEX,
         });
 
+        // The first `Resized` lands while `App::state` is still `None`, so configure here.
+        let is_surface_configured = size.width > 0 && size.height > 0;
+        if is_surface_configured {
+            surface.configure(&device, &config);
+        }
+
         Ok(Self {
             window,
             surface,
             device,
             queue,
             config,
-            is_surface_configured: false,
+            is_surface_configured,
             render_pipeline,
             vertex_buffer,
             index_buffer,
@@ -341,13 +395,14 @@ impl State {
         }
     }
 
-    fn render(&mut self) {
+    /// Returns false once the capture has ended, so the caller can leave the event loop.
+    fn render(&mut self) -> bool {
         info!("Rendering frame");
         self.window.request_redraw();
 
         // We can't render unless the surface is configured
         if !self.is_surface_configured {
-            return;
+            return true;
         }
 
         // `get_current_texture` no longer returns a `Result`; every outcome, including
@@ -357,19 +412,21 @@ impl State {
             // Usable, but the surface wants reconfiguring before the next frame.
             CurrentSurfaceTexture::Suboptimal(output) => (output, true),
             // Nothing to draw into right now; try again on the next redraw.
-            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return,
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return true,
             CurrentSurfaceTexture::Outdated | CurrentSurfaceTexture::Lost => {
                 warn!("Surface lost or outdated, reconfiguring...");
                 let size = self.window.inner_size();
                 self.resize(size.width, size.height);
-                return;
+                return true;
             }
             CurrentSurfaceTexture::Validation => {
                 error!("Unable to render: surface validation error");
-                return;
+                return true;
             }
         };
-        self.update();
+        if !self.update() {
+            return false;
+        }
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -420,6 +477,7 @@ impl State {
             let size = self.window.inner_size();
             self.resize(size.width, size.height);
         }
+        true
     }
 
     fn handle_key(&self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
@@ -430,8 +488,21 @@ impl State {
         }
     }
 
-    fn update(&mut self) {
-        let VideoFrame { vframe, size, .. } = self.capture_desc.video().recv().unwrap();
+    /// Returns false once the capture has ended.
+    ///
+    /// Never blocks: this runs on the event loop, so waiting for a frame here would freeze
+    /// the window whenever delivery stalls -- which is exactly what happens when the capture
+    /// is stopped from outside, e.g. macOS's "Stop Sharing".
+    fn update(&mut self) -> bool {
+        let frame = match self.capture_desc.video().try_recv() {
+            Ok(frame) => frame,
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => {
+                info!("capture ended");
+                return false;
+            }
+        };
+        let VideoFrame { vframe, size, .. } = frame;
         self.queue.write_texture(
             // Tells wgpu where to copy the pixel data
             wgpu::TexelCopyTextureInfo {
@@ -450,6 +521,7 @@ impl State {
             },
             self.diffuse_texture.texture_size,
         );
+        true
     }
 }
 

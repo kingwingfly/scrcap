@@ -30,6 +30,8 @@ pub enum CaptureError {
     IO(#[from] std::io::Error),
     #[error("No target found for the capture.")]
     TargetNotFound,
+    #[error("The capture target is not usable: {0}")]
+    InvalidTarget(String),
     #[error("The capture thread terminated unexpectedly.")]
     WorkerGone,
 }

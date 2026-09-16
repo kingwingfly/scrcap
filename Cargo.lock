@@ -2091,6 +2091,7 @@ dependencies = [
  "pipewire",
  "pollster",
  "rand",
+ "regex",
  "thiserror 2.0.20",
  "tracing",
  "wgpu",

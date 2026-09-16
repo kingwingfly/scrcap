@@ -1,7 +1,4 @@
-/// Drops frames that arrive faster than the configured cap.
-///
-/// No platform enforces its own framerate knob reliably, so the cap is also applied here,
-/// before the frame is copied out of the capture buffer.
+/// Drops frames that arrive faster than the cap, which no platform enforces reliably.
 #[derive(Debug)]
 pub(crate) struct FpsGate {
     interval: u64,
@@ -30,8 +27,7 @@ impl FpsGate {
         if ts < next {
             return false;
         }
-        // Advance by whole intervals so the average rate is the cap, but resync after a
-        // stall so catching up cannot emit a burst.
+        // Whole intervals, not from `ts`: a 75 Hz source under a 60 cap would emit 37.5.
         self.next = Some(if ts > next + self.interval {
             ts + self.interval
         } else {

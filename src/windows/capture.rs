@@ -284,12 +284,6 @@ impl VideoConfig {
                         )?;
 
                         let session = pool.CreateCaptureSession(&item)?; // I do not care if item size changed
-                        if ApiInformation::IsPropertyPresent(
-                            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
-                            &HSTRING::from("IsBorderRequired"),
-                        )? {
-                            session.SetIsBorderRequired(true)?;
-                        }
                         if let Some(fps) = fps.filter(|fps| *fps > 0)
                             && ApiInformation::IsPropertyPresent(
                                 &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),

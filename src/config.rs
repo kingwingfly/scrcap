@@ -35,9 +35,9 @@ pub struct VideoConfig {
     /// audio buffer, and dropping one is cheap where dropping audio is not.
     pub channel_capacity: usize,
     /// The window id to hide from capture:
-    /// - Windows: HWND
-    /// - macOS: NSView ptr, resolved to its window's `CGWindowID` on the main thread, so
-    ///   that thread must be running its loop if `create` is called from anywhere else.
+    /// - Windows: `HWND`
+    /// - macOS: `CGWindowID`, which `platform::window_id_from_ns_view` derives from the
+    ///   `NSView` a window handle gives you.
     /// - Linux: unsupported, a non-empty list is [`Unsupported::HideWindows`]. Neither
     ///   Wayland nor X11 lets a client opt a window out of a screencast.
     ///

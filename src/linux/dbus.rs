@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 
 use dbus::{
     MessageType, Path,
-    arg::{Iter, PropMap, ReadAll, RefArg, TypeMismatchError, Variant},
+    arg::{Iter, OwnedFd, PropMap, ReadAll, RefArg, TypeMismatchError, Variant},
     blocking::Connection,
     message::MatchRule,
     strings::{BusName, Interface},
@@ -12,9 +12,15 @@ use parking_lot::Mutex;
 
 use crate::error::{CaptureError, PortalCall, PortalError, Result};
 
-const TOKEN: &str = "scrcap";
-
 pub const SOURCE_TYPE_MONITOR: u32 = 1;
+
+/// A request in flight: the token that names it, the object path its `Response` signal was
+/// predicted to arrive on, and the slot that signal lands in.
+struct Request {
+    token: String,
+    path: Path<'static>,
+    slot: Arc<Mutex<Option<Response>>>,
+}
 
 #[derive(Debug)]
 pub struct Response {
@@ -31,6 +37,13 @@ impl ReadAll for Response {
     }
 }
 
+/// What a granted ScreenCast session hands over: the video node, and the PipeWire remote
+/// it lives on.
+pub struct Session {
+    pub node_id: u32,
+    pub fd: OwnedFd,
+}
+
 pub struct DbusScreen {
     connection: Connection,
 }
@@ -42,26 +55,29 @@ impl DbusScreen {
         })
     }
 
-    pub fn start(&self, wanted_source_types: u32) -> Result<u32> {
+    pub fn start(&self, wanted_source_types: u32) -> Result<Session> {
         let proxy = self.connection.with_proxy(
             "org.freedesktop.portal.Desktop",
             "/org/freedesktop/portal/desktop",
             Duration::from_secs(3),
         );
-        let token = TOKEN.to_string();
 
         // create session
+        let request = self.watch("create")?;
         let mut map = PropMap::new();
-        map.insert("handle_token".to_string(), Variant(Box::new(token.clone())));
+        map.insert(
+            "handle_token".to_string(),
+            Variant(Box::new(request.token.clone())),
+        );
         map.insert(
             "session_handle_token".to_string(),
-            Variant(Box::new(token.clone())),
+            Variant(Box::new(request.token.clone())),
         );
         let path = proxy
             .method_call("org.freedesktop.portal.ScreenCast", "CreateSession", (map,))
             .map(|r: (Path<'static>,)| r.0)?;
 
-        let resp = self.recv_resp(path, PortalCall::CreateSession)?;
+        let resp = self.recv_resp(&request, path)?;
         check_response(&resp, PortalCall::CreateSession)?;
         let handle = resp
             .results
@@ -93,10 +109,11 @@ impl DbusScreen {
             }
             wanted
         };
+        let request = self.watch("select")?;
         let mut map = PropMap::new();
         map.insert(
             String::from("handle_token"),
-            Variant(Box::new(token.clone())),
+            Variant(Box::new(request.token.clone())),
         );
         map.insert(String::from("types"), Variant(Box::new(source_type)));
         map.insert(String::from("multiple"), Variant(Box::new(false)));
@@ -109,19 +126,25 @@ impl DbusScreen {
             )
             .map(|r: (Path<'static>,)| r.0)?;
 
-        let resp = self.recv_resp(path, PortalCall::SelectSources)?;
+        let resp = self.recv_resp(&request, path)?;
         check_response(&resp, PortalCall::SelectSources)?;
 
         // start capturing
+        let request = self.watch("start")?;
+        let mut map = PropMap::new();
+        map.insert(
+            String::from("handle_token"),
+            Variant(Box::new(request.token.clone())),
+        );
         let path = proxy
             .method_call(
                 "org.freedesktop.portal.ScreenCast",
                 "Start",
-                (handle, "", PropMap::new()),
+                (handle.clone(), "", map),
             )
             .map(|r: (Path<'static>,)| r.0)?;
 
-        let resp = self.recv_resp(path, PortalCall::Start)?;
+        let resp = self.recv_resp(&request, path)?;
         check_response(&resp, PortalCall::Start)?;
         let pipewire_node_id = resp
             .results
@@ -136,12 +159,50 @@ impl DbusScreen {
             .ok_or(PortalError::MalformedReply {
                 call: PortalCall::Start,
             })?;
-        Ok(pipewire_node_id as u32)
+
+        // The screencast nodes live on the remote the portal hands out, which in a sandbox
+        // is the only PipeWire socket this process may open.
+        let fd = proxy
+            .method_call(
+                "org.freedesktop.portal.ScreenCast",
+                "OpenPipeWireRemote",
+                (handle, PropMap::new()),
+            )
+            .map(|r: (OwnedFd,)| r.0)?;
+
+        Ok(Session {
+            node_id: pipewire_node_id as u32,
+            fd,
+        })
     }
 
-    fn recv_resp(&self, path: Path<'static>, call: PortalCall) -> Result<Response> {
-        let resp = Arc::new(Mutex::new(None));
-        let mut resp_guard = resp.lock_arc();
+    /// Install the `Response` match *before* the call that triggers it.
+    ///
+    /// `add_match` is itself a round trip to the bus and D-Bus drops signals no rule
+    /// matches, so a portal that answers without asking the user -- a remembered
+    /// permission, an auto-accepting portal -- would otherwise win the race and the wait
+    /// below would never end. The request's object path is predictable from the spec, so
+    /// the rule can go in first.
+    fn watch(&self, name: &str) -> Result<Request> {
+        let sender = self
+            .connection
+            .unique_name()
+            .trim_start_matches(':')
+            .replace('.', "_");
+        let token = format!("scrcap_{name}");
+        let path = Path::from(format!(
+            "/org/freedesktop/portal/desktop/request/{sender}/{token}"
+        ));
+        let slot = Arc::new(Mutex::new(None));
+        self.add_response_match(path.clone(), Arc::clone(&slot))?;
+        Ok(Request { token, path, slot })
+    }
+
+    fn add_response_match(
+        &self,
+        path: Path<'static>,
+        slot: Arc<Mutex<Option<Response>>>,
+    ) -> Result<()> {
         let mut rule = MatchRule::new();
         rule.path = Some(path);
         rule.msg_type = Some(MessageType::Signal);
@@ -149,14 +210,27 @@ impl DbusScreen {
         rule.interface = Some(Interface::from("org.freedesktop.portal.Request"));
         self.connection
             .add_match(rule, move |res: Response, _c, _msg| {
-                *resp_guard = Some(res);
+                *slot.lock() = Some(res);
                 false
             })?;
+        Ok(())
+    }
 
+    /// Pump the bus until the watched request answers.
+    ///
+    /// Deliberately without a deadline: `SelectSources` and `Start` raise the portal's own
+    /// picker, so the wait is as long as the user takes. A portal that dies instead shows
+    /// up as an error from `process`.
+    fn recv_resp(&self, request: &Request, actual: Path<'static>) -> Result<Response> {
+        // The path is only predicted; watch the one the portal actually returned too if a
+        // portal ever disagrees, so a mismatch costs the race rather than the whole wait.
+        if actual != request.path {
+            self.add_response_match(actual, Arc::clone(&request.slot))?;
+        }
         loop {
             self.connection.process(Duration::from_millis(100))?;
-            if let Some(mut guard) = resp.try_lock() {
-                return guard.take().ok_or(PortalError::NoResponse { call }.into());
+            if let Some(resp) = request.slot.lock().take() {
+                return Ok(resp);
             }
         }
     }

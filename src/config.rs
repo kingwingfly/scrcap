@@ -105,6 +105,10 @@ pub enum Target {
     /// macOS needs 14.0 or newer, and `create` blocks until the user has chosen. The picker
     /// answers on the main queue, so `create` must not be called from the main thread —
     /// doing so deadlocks.
+    ///
+    /// On Linux the portal's picker also lists this process's own windows, and nothing can
+    /// take them out. Make sure such a window has drawn before calling `create`: GNOME's
+    /// mutter has been seen to crash capturing one that had not.
     #[cfg(not(target_os = "windows"))]
     Pick,
 }

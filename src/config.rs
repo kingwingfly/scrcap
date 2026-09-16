@@ -19,14 +19,23 @@ pub struct VideoConfig {
     pub channel_capacity: usize,
     /// The window id to hide from capture:
     /// - Windows: HWND
-    /// - macOS: NSView ptr
-    /// - linux: unsupported
+    /// - macOS: NSView ptr. Hiding is done on the main thread, so that thread must be
+    ///   running its loop if `create` is called from anywhere else.
+    /// - Linux: unsupported, a non-empty list is [`CaptureError::Unsupported`]. Neither
+    ///   Wayland nor X11 lets a client opt a window out of a screencast.
+    ///
+    /// [`CaptureError::Unsupported`]: crate::error::CaptureError::Unsupported
     pub hide: Vec<isize>,
     /// The target to capture.
     ///
-    /// Linux: Primary/Monitor pick a monitor, Pick anything; Window/WindowName unsupported
-    /// macOS: only primary monitor
-    /// Windows: except WindowName and Pick
+    /// Everything is supported everywhere except where noted:
+    /// - Linux: the XDG portal picker always makes the final choice, so `Primary` and
+    ///   `Monitor` only restrict it to monitors (the index is *not* honoured), and
+    ///   `Window`/`WindowName` are [`CaptureError::Unsupported`].
+    /// - `Pick` blocks until the user chooses, so on Windows and macOS it must not be
+    ///   called from the thread driving the UI.
+    ///
+    /// [`CaptureError::Unsupported`]: crate::error::CaptureError::Unsupported
     pub target: Target,
     /// Cap on delivered frames per second, `None` to leave the source uncapped.
     ///
@@ -54,10 +63,29 @@ pub enum Target {
     /// Capture a specific monitor by its index.
     Monitor(isize),
     /// Capture a specific window by its window id:
-    /// - Windows: HWND
+    /// - Windows: `HWND`
+    /// - macOS: `CGWindowID`
+    /// - Linux: unsupported, [`CaptureError::Unsupported`]
+    ///
+    /// [`CaptureError::Unsupported`]: crate::error::CaptureError::Unsupported
     Window(isize),
-    /// Capture a specific window first found by matching the given regex.
+    /// Capture the first visible window whose title matches the given regex.
     WindowName(String),
-    /// Use picker api to select the target.
+    /// Let the user choose with the system picker.
+    ///
+    /// The inner value is the `HWND` to present the picker from; it has to be a window this
+    /// process owns.
+    ///
+    /// `create` blocks until the user has chosen, and the wait does not pump messages, so it
+    /// must not be called from the thread that owns that `HWND` (or from any other STA
+    /// thread) — doing so deadlocks.
+    #[cfg(target_os = "windows")]
+    Pick(isize),
+    /// Let the user choose with the system picker.
+    ///
+    /// macOS needs 14.0 or newer, and `create` blocks until the user has chosen. The picker
+    /// answers on the main queue, so `create` must not be called from the main thread —
+    /// doing so deadlocks.
+    #[cfg(not(target_os = "windows"))]
     Pick,
 }

@@ -70,6 +70,8 @@ impl CaptureDescriptor for CaptureDesc {
 
 impl Drop for CaptureDesc {
     fn drop(&mut self) {
+        // Stop first: the callbacks only `try_send`, so disconnecting early just wastes copies.
+        self.pipewire_session.terminate();
         let _ = self.v_rx.take();
         let _ = self.a_rx.take();
     }

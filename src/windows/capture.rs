@@ -12,11 +12,14 @@ use parking_lot::Mutex;
 use windows::{
     Foundation::{Metadata::ApiInformation, TimeSpan, TypedEventHandler},
     Graphics::{
-        Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession},
+        Capture::{
+            Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCapturePicker,
+            GraphicsCaptureSession,
+        },
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
     },
     Win32::{
-        Foundation::{HMODULE, HWND, LPARAM, POINT, RECT, TRUE},
+        Foundation::{FALSE, HMODULE, HWND, LPARAM, POINT, RECT, TRUE},
         Graphics::{
             Direct3D::{
                 self, D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -50,13 +53,17 @@ use windows::{
                 Graphics::Capture::IGraphicsCaptureItemInterop,
             },
         },
+        UI::Shell::IInitializeWithWindow,
         UI::WindowsAndMessaging::{
-            DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
-            WINDOW_DISPLAY_AFFINITY, WM_NULL, WM_USER,
+            DispatchMessageW, EnumWindows, GetMessageW, GetWindowTextW, IsWindowVisible, MSG,
+            PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WINDOW_DISPLAY_AFFINITY, WM_NULL,
+            WM_USER,
         },
     },
     core::{BOOL, HSTRING, IInspectable, Interface as _, factory},
 };
+
+use regex::Regex;
 
 use super::utils::{hide_window_from_capture, restore_window_capture_affinity};
 use crate::{
@@ -106,6 +113,33 @@ unsafe extern "system" fn collect_monitor(
     TRUE
 }
 
+unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    unsafe {
+        if IsWindowVisible(hwnd).as_bool() {
+            let mut title = [0u16; 512];
+            let len = GetWindowTextW(hwnd, &mut title) as usize;
+            if len > 0 {
+                let found = &mut *(lparam.0 as *mut (Regex, Option<HWND>));
+                if found.0.is_match(&String::from_utf16_lossy(&title[..len])) {
+                    found.1 = Some(hwnd);
+                    return FALSE;
+                }
+            }
+        }
+    }
+    TRUE
+}
+
+fn window_by_title(pattern: &str) -> Result<HWND> {
+    let re = Regex::new(pattern)
+        .map_err(|e| CaptureError::InvalidTarget(format!("bad window regex: {e}")))?;
+    let mut found = (re, None);
+    unsafe {
+        let _ = EnumWindows(Some(collect_window), LPARAM(&mut found as *mut _ as isize));
+    }
+    found.1.ok_or(CaptureError::TargetNotFound)
+}
+
 fn monitor_from_index(index: isize) -> Result<HMONITOR> {
     if index < 0 {
         return Err(CaptureError::TargetNotFound);
@@ -126,6 +160,45 @@ fn monitor_from_index(index: isize) -> Result<HMONITOR> {
         .ok_or(CaptureError::TargetNotFound)
 }
 
+fn capture_item(target: Target) -> Result<GraphicsCaptureItem> {
+    let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+    Ok(match target {
+        Target::Primary => {
+            let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONULL) };
+            if monitor.is_invalid() {
+                return Err(CaptureError::TargetNotFound);
+            }
+            unsafe { interop.CreateForMonitor(monitor)? }
+        }
+        Target::Monitor(index) => {
+            let monitor = monitor_from_index(index)?;
+            unsafe { interop.CreateForMonitor(monitor)? }
+        }
+        Target::Window(hwnd) => unsafe { interop.CreateForWindow(HWND(hwnd as _))? },
+        Target::WindowName(pattern) => {
+            let hwnd = window_by_title(&pattern)?;
+            unsafe { interop.CreateForWindow(hwnd)? }
+        }
+        Target::Pick(parent) => {
+            let picker = GraphicsCapturePicker::new()?;
+            let init: IInitializeWithWindow = picker.cast()?;
+            unsafe { init.Initialize(HWND(parent as _))? };
+            // Dismissing yields a null item, which windows-rs reports as a success-coded error.
+            match picker.PickSingleItemAsync()?.join() {
+                Ok(item) => item,
+                Err(e) if e.code().is_ok() => return Err(CaptureError::TargetNotFound),
+                Err(e) => return Err(CaptureError::Win(e)),
+            }
+        }
+    })
+}
+
+fn restore_hidden(hidden: &[(isize, WINDOW_DISPLAY_AFFINITY)]) {
+    for (hwnd, previous) in hidden {
+        restore_window_capture_affinity(HWND(*hwnd as _), *previous);
+    }
+}
+
 impl VideoConfig {
     /// Create a new capture configuration.
     fn create(
@@ -138,43 +211,34 @@ impl VideoConfig {
         }
         let fps = self.fps;
 
-        let item: GraphicsCaptureItem = match self.target {
-            Target::Primary => {
-                let monitor =
-                    unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONULL) };
-                if monitor.is_invalid() {
-                    return Err(CaptureError::TargetNotFound);
-                }
-                let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-                unsafe { interop.CreateForMonitor(monitor)? }
-            }
-            Target::Monitor(index) => {
-                let monitor = monitor_from_index(index)?;
-                let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-                unsafe { interop.CreateForMonitor(monitor)? }
-            }
-            Target::Window(hwnd) => {
-                let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-                unsafe { interop.CreateForWindow(HWND(hwnd as _))? }
-            }
-            Target::WindowName(_) | Target::Pick => return Err(CaptureError::Unsupported),
-        };
-
+        // Before resolving the target: `Pick` would otherwise offer the hidden windows.
         let mut hidden = Vec::with_capacity(self.hide.len());
         for hide in &self.hide {
             let hwnd = HWND(*hide as _);
             match hide_window_from_capture(hwnd) {
                 Ok(previous) => hidden.push((*hide, previous)),
                 Err(e) => {
-                    for (hwnd, previous) in hidden {
-                        restore_window_capture_affinity(HWND(hwnd as _), previous);
-                    }
+                    restore_hidden(&hidden);
                     return Err(e);
                 }
             }
         }
 
-        let item_size = item.Size()?;
+        let item = match capture_item(self.target) {
+            Ok(item) => item,
+            Err(e) => {
+                restore_hidden(&hidden);
+                return Err(e);
+            }
+        };
+
+        let item_size = match item.Size() {
+            Ok(size) => size,
+            Err(e) => {
+                restore_hidden(&hidden);
+                return Err(e.into());
+            }
+        };
         let size = Arc::new(Mutex::new((
             item_size.Width as u32,
             item_size.Height as u32,
@@ -182,6 +246,7 @@ impl VideoConfig {
 
         let (setup_tx, setup_rx) = bounded::<Result<u32>>(1);
 
+        let desc_terminate = terminate.clone();
         let jh = thread::spawn(unsafe {
             let size = size.clone();
             let setup_tx = setup_tx.clone();
@@ -344,6 +409,22 @@ impl VideoConfig {
                                 Ok(())
                             },
                         ))?;
+                        let terminate_closed = terminate.clone();
+                        let pump = GetCurrentThreadId();
+                        item.Closed(
+                            &TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(
+                                move |_, _| {
+                                    terminate_closed.store(true, Ordering::Relaxed);
+                                    let _ = PostThreadMessageW(
+                                        pump,
+                                        WM_NULL,
+                                        Default::default(),
+                                        LPARAM(0),
+                                    );
+                                    Ok(())
+                                },
+                            ),
+                        )?;
                         session.StartCapture()?;
                         Ok((pool, session, token))
                     })();
@@ -386,16 +467,12 @@ impl VideoConfig {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => {
                 let _ = jh.join();
-                for (hwnd, previous) in hidden {
-                    restore_window_capture_affinity(HWND(hwnd as _), previous);
-                }
+                restore_hidden(&hidden);
                 return Err(e);
             }
             Err(_) => {
                 let _ = jh.join();
-                for (hwnd, previous) in hidden {
-                    restore_window_capture_affinity(HWND(hwnd as _), previous);
-                }
+                restore_hidden(&hidden);
                 return Err(CaptureError::WorkerGone);
             }
         };
@@ -405,6 +482,7 @@ impl VideoConfig {
             jh: Some(jh),
             thread_id,
             hidden,
+            terminate: desc_terminate,
         })
     }
 }
@@ -463,6 +541,7 @@ impl AudioConfig {
         let sample_rate = Arc::new(Mutex::new(0));
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let (setup_tx, setup_rx) = bounded::<Result<()>>(1);
+        let desc_terminate = terminate.clone();
         let jh = thread::spawn(unsafe {
             let sample_rate = sample_rate.clone();
             let mut sample_rate_guard = sample_rate.lock_arc();
@@ -628,6 +707,7 @@ impl AudioConfig {
             sample_rate,
             jh: Some(jh),
             wake_tx,
+            terminate: desc_terminate,
         })
     }
 }
@@ -649,7 +729,11 @@ struct CaptureVideoDesc {
     size: Arc<Mutex<(u32, u32)>>,
     jh: Option<JoinHandle<Result<()>>>,
     thread_id: u32,
+    /// `HWND`s, and the affinity each had before being hidden.
     hidden: Vec<(isize, WINDOW_DISPLAY_AFFINITY)>,
+    /// Owned so that dropping this desc on its own -- which is what happens when audio setup
+    /// fails after video already started -- still stops the worker it joins.
+    terminate: Arc<AtomicBool>,
 }
 
 impl CaptureVideoDesc {
@@ -666,6 +750,7 @@ impl CaptureVideoDesc {
 
 impl Drop for CaptureVideoDesc {
     fn drop(&mut self) {
+        self.terminate.store(true, Ordering::Relaxed);
         self.wake();
         if let Some(jh) = self.jh.take() {
             let _ = jh.join();
@@ -681,6 +766,7 @@ struct CaptureAudioDesc {
     sample_rate: Arc<Mutex<i32>>,
     jh: Option<JoinHandle<Result<()>>>,
     wake_tx: Sender<()>,
+    terminate: Arc<AtomicBool>,
 }
 
 impl CaptureAudioDesc {
@@ -695,6 +781,7 @@ impl CaptureAudioDesc {
 
 impl Drop for CaptureAudioDesc {
     fn drop(&mut self) {
+        self.terminate.store(true, Ordering::Relaxed);
         self.wake();
         if let Some(jh) = self.jh.take() {
             let _ = jh.join();

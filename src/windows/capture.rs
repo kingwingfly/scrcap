@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -64,6 +64,7 @@ use windows::{
 };
 
 use regex::Regex;
+use tracing::error;
 
 use super::utils::{hide_window_from_capture, restore_window_capture_affinity};
 use crate::{
@@ -73,6 +74,7 @@ use crate::{
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
+    util::pack_rows,
 };
 
 impl CaptureConfig {
@@ -275,7 +277,7 @@ impl VideoConfig {
                         let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)?;
                         let device: IDirect3DDevice = inspectable.cast()?;
 
-                        let pool = Direct3D11CaptureFramePool::Create(
+                        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
                             &device,
                             DirectXPixelFormat::B8G8R8A8UIntNormalized,
                             3,
@@ -376,30 +378,13 @@ impl VideoConfig {
                                 let row_bytes = desc.Width as usize * 4;
                                 let pitch = mapped.RowPitch as usize;
                                 let height = desc.Height as usize;
-                                if mapped.pData.is_null() || pitch < row_bytes {
-                                    d3d_device_context.Unmap(&cpu_texture, 0);
-                                    return Ok(());
-                                }
-                                let vframe = if pitch == row_bytes {
-                                    core::slice::from_raw_parts(
-                                        mapped.pData as *const u8,
-                                        row_bytes * height,
-                                    )
-                                    .to_vec()
-                                } else {
-                                    let padded = core::slice::from_raw_parts(
-                                        mapped.pData as *const u8,
-                                        pitch * height,
-                                    );
-                                    let mut packed = Vec::with_capacity(row_bytes * height);
-                                    for row in 0..height {
-                                        let start = row * pitch;
-                                        packed.extend_from_slice(&padded[start..start + row_bytes]);
-                                    }
-                                    packed
-                                };
+                                let vframe =
+                                    pack_rows(mapped.pData as *const u8, pitch, row_bytes, height);
                                 d3d_device_context.Unmap(&cpu_texture, 0);
                                 drop(staging);
+                                let Some(vframe) = vframe else {
+                                    return Ok(());
+                                };
                                 let _ = tx.try_send(VideoFrame {
                                     vframe,
                                     size: (desc.Width, desc.Height),
@@ -489,13 +474,18 @@ impl VideoConfig {
 
 /// Now, in nanoseconds on the same QPC timeline WASAPI and WGC report their timestamps on.
 fn qpc_now() -> u64 {
+    // Fixed at boot, and this sits on a per-frame path.
+    static FREQUENCY: OnceLock<i64> = OnceLock::new();
     unsafe {
-        let (mut counter, mut frequency) = (0i64, 0i64);
-        if QueryPerformanceCounter(&mut counter).is_err()
-            || QueryPerformanceFrequency(&mut frequency).is_err()
-            || frequency <= 0
-            || counter < 0
-        {
+        let frequency = *FREQUENCY.get_or_init(|| {
+            let mut frequency = 0i64;
+            match QueryPerformanceFrequency(&mut frequency) {
+                Ok(()) if frequency > 0 => frequency,
+                _ => 0,
+            }
+        });
+        let mut counter = 0i64;
+        if frequency <= 0 || QueryPerformanceCounter(&mut counter).is_err() || counter < 0 {
             return 0;
         }
         (counter as u128 * 1_000_000_000 / frequency as u128) as u64
@@ -622,70 +612,89 @@ impl AudioConfig {
                 drop(sample_rate_guard); // release the lock
                 let _ = setup_tx.send(Ok(()));
 
-                let duration =
-                    Duration::from_nanos(1_000_000_000 * buffer_frames as u64 / sample_rate as u64);
+                let poll = Duration::from_nanos(
+                    1_000_000_000 * buffer_frames as u64 / sample_rate as u64 / 2,
+                )
+                .min(Duration::from_millis(10));
                 let frame_bytes = nb_channels as usize * sample_size;
+                let poll_bytes = (sample_rate as u64 * poll.as_nanos() as u64 / 1_000_000_000 + 1)
+                    as usize
+                    * frame_bytes;
                 let mut data: *mut u8 = core::ptr::null_mut();
                 let mut nb_frames = 0u32;
                 let mut flags = 0u32;
                 let mut qpc = 0u64;
                 let mut next_ts = qpc_now();
-                while !terminate.load(Ordering::Relaxed) {
-                    match wake_rx.recv_timeout(duration / 2) {
-                        Err(RecvTimeoutError::Timeout) => {}
-                        _ => break,
-                    }
-                    let mut aframe = Vec::with_capacity(buffer_frames as usize * frame_bytes);
-                    let mut nb_samples = 0u32;
-                    let mut ts = None;
-                    while capture_client.GetNextPacketSize()? != 0 {
-                        capture_client.GetBuffer(
-                            &mut data as *mut _,
-                            &mut nb_frames as *mut _,
-                            &mut flags as *mut _,
-                            None,
-                            Some(&mut qpc),
-                        )?;
-                        ts.get_or_insert(qpc * 100);
-                        let packet_bytes = nb_frames as usize * frame_bytes;
-                        if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
-                            aframe
-                                .extend_from_slice(core::slice::from_raw_parts(data, packet_bytes));
-                        } else {
-                            aframe.resize(aframe.len() + packet_bytes, 0);
+                // Wrapped so that a mid-capture failure still stops the client and balances
+                // the `CoInitializeEx` above instead of leaking the apartment.
+                let mut pump = || -> Result<()> {
+                    while !terminate.load(Ordering::Relaxed) {
+                        match wake_rx.recv_timeout(poll) {
+                            Err(RecvTimeoutError::Timeout) => {}
+                            _ => break,
                         }
-                        nb_samples += nb_frames;
-                        capture_client.ReleaseBuffer(nb_frames)?;
-                    }
-                    if aframe.is_empty() {
-                        let gap = qpc_now().saturating_sub(next_ts);
-                        nb_samples = (gap as u128 * sample_rate as u128 / 1_000_000_000)
-                            .min(sample_rate as u128) as u32;
-                        if nb_samples == 0 {
-                            continue;
+                        let mut aframe = Vec::with_capacity(poll_bytes);
+                        let mut nb_samples = 0u32;
+                        let mut ts = None;
+                        while capture_client.GetNextPacketSize()? != 0 {
+                            capture_client.GetBuffer(
+                                &mut data as *mut _,
+                                &mut nb_frames as *mut _,
+                                &mut flags as *mut _,
+                                None,
+                                Some(&mut qpc),
+                            )?;
+                            ts.get_or_insert(qpc * 100);
+                            let packet_bytes = nb_frames as usize * frame_bytes;
+                            if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
+                                aframe.extend_from_slice(core::slice::from_raw_parts(
+                                    data,
+                                    packet_bytes,
+                                ));
+                            } else {
+                                aframe.resize(aframe.len() + packet_bytes, 0);
+                            }
+                            nb_samples += nb_frames;
+                            capture_client.ReleaseBuffer(nb_frames)?;
                         }
-                        aframe.resize(nb_samples as usize * frame_bytes, 0);
-                        ts = Some(next_ts);
-                    }
-                    let ts = ts.unwrap_or(next_ts);
-                    next_ts =
-                        ts + (nb_samples as u128 * 1_000_000_000 / sample_rate as u128) as u64;
-                    match tx.try_send(AudioFrame {
-                        aframe,
-                        nb_samples: nb_samples as i32,
-                        sample_rate,
-                        nb_channels,
-                        sample_fmt,
-                        ts,
-                    }) {
-                        Ok(()) | Err(TrySendError::Full(_)) => {}
-                        Err(TrySendError::Disconnected(_)) => {
-                            terminate.store(true, Ordering::Relaxed)
+                        if aframe.is_empty() {
+                            let gap = qpc_now().saturating_sub(next_ts);
+                            nb_samples = (gap as u128 * sample_rate as u128 / 1_000_000_000)
+                                .min(sample_rate as u128)
+                                as u32;
+                            if nb_samples == 0 {
+                                continue;
+                            }
+                            aframe.resize(nb_samples as usize * frame_bytes, 0);
+                            ts = Some(next_ts);
+                        }
+                        let ts = ts.map_or(next_ts, |ts| ts.max(next_ts));
+                        next_ts =
+                            ts + (nb_samples as u128 * 1_000_000_000 / sample_rate as u128) as u64;
+                        match tx.try_send(AudioFrame {
+                            aframe,
+                            nb_samples: nb_samples as i32,
+                            sample_rate,
+                            nb_channels,
+                            sample_fmt,
+                            ts,
+                        }) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => {
+                                terminate.store(true, Ordering::Relaxed)
+                            }
                         }
                     }
-                }
-                audio_client.Stop()?;
+                    Ok(())
+                };
+                let pumped = pump();
+                let stopped = audio_client.Stop();
                 CoUninitialize();
+                if let Err(e) = &pumped {
+                    error!("audio capture stopped: {e}");
+                }
+                pumped?;
+                stopped?;
                 Ok(())
             }
         });
@@ -731,8 +740,6 @@ struct CaptureVideoDesc {
     thread_id: u32,
     /// `HWND`s, and the affinity each had before being hidden.
     hidden: Vec<(isize, WINDOW_DISPLAY_AFFINITY)>,
-    /// Owned so that dropping this desc on its own -- which is what happens when audio setup
-    /// fails after video already started -- still stops the worker it joins.
     terminate: Arc<AtomicBool>,
 }
 

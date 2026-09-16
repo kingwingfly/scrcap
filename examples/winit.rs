@@ -503,6 +503,17 @@ impl State {
             }
         };
         let VideoFrame { vframe, size, .. } = frame;
+        // The texture is sized once from `capture_desc.size()`; a frame of any other size
+        // would make `write_texture` panic on the extent check rather than render wrong.
+        if (size.0, size.1)
+            != (
+                self.diffuse_texture.texture_size.width,
+                self.diffuse_texture.texture_size.height,
+            )
+        {
+            warn!("capture size changed to {size:?}, skipping frame");
+            return true;
+        }
         self.queue.write_texture(
             // Tells wgpu where to copy the pixel data
             wgpu::TexelCopyTextureInfo {

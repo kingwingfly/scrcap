@@ -19,7 +19,7 @@ use crossbeam_channel::{Receiver, bounded};
 use crossbeam_utils::sync::{Parker, Unparker};
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::{
-    AnyThread as _, MainThreadMarker,
+    AnyThread as _, ClassType as _, MainThreadMarker,
     rc::Retained,
     runtime::{AnyClass, ProtocolObject},
     sel,
@@ -130,13 +130,22 @@ impl CaptureConfig {
                         target_rx.recv().map_err(|_| CaptureError::WorkerGone)??
                     };
 
-                    let stream_config = SCStreamConfiguration::streamConfigurationWithPreset(
-                        SCStreamConfigurationPreset::CaptureHDRScreenshotLocalDisplay,
-                    );
+                    let stream_config = if SCStreamConfiguration::class()
+                        .metaclass()
+                        .responds_to(sel!(streamConfigurationWithPreset:))
+                    {
+                        SCStreamConfiguration::streamConfigurationWithPreset(
+                            SCStreamConfigurationPreset::CaptureHDRScreenshotLocalDisplay,
+                        )
+                    } else {
+                        SCStreamConfiguration::new()
+                    };
                     stream_config.setWidth(width);
                     stream_config.setHeight(height);
                     stream_config.setCapturesAudio(self.audio.is_some());
-                    stream_config.setCaptureMicrophone(false);
+                    if stream_config.respondsToSelector(sel!(setCaptureMicrophone:)) {
+                        stream_config.setCaptureMicrophone(false);
+                    }
                     stream_config.setPixelFormat(u32::from_be_bytes(*b"BGRA"));
                     if let Some(fps) = self.video.fps.filter(|fps| *fps > 0) {
                         stream_config.setMinimumFrameInterval(CMTime {

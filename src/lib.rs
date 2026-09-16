@@ -7,6 +7,8 @@ pub mod error;
 pub mod format;
 mod fps;
 pub mod frame;
+#[cfg(not(feature = "dummy"))]
+mod util;
 
 #[cfg(feature = "dummy")]
 pub mod dummy;
@@ -51,7 +53,11 @@ mod tests {
         let capture_desc = config.create().expect("Failed to create capture");
         let mut nb_frames = 0;
         let mut total_nb_samples = 0;
-        let mut last_ts = 0;
+        // One running maximum per stream: video and audio share a clock, but they are
+        // produced by separate threads into separate channels, so the *interleaving* of the
+        // two is not ordered even when each stream is.
+        let mut last_video_ts = 0;
+        let mut last_audio_ts = 0;
         let now = std::time::Instant::now();
         for i in 0..300 {
             println!("{i}");
@@ -61,12 +67,12 @@ mod tests {
                         let frame = frame.unwrap();
                         let (width, height) = frame.size;
                         assert_eq!(frame.vframe.len(), (width * height * 4) as usize);
-                        check_ts(frame.ts, &mut last_ts);
+                        check_ts(frame.ts, &mut last_video_ts);
                         nb_frames += 1;
                     }
                     recv(audio) -> frame => {
                         let frame = frame.unwrap();
-                        check_ts(frame.ts, &mut last_ts);
+                        check_ts(frame.ts, &mut last_audio_ts);
                         total_nb_samples += frame.nb_samples;
                     }
                     default(Duration::from_secs(4)) => panic!("no frame within 4 s"),
@@ -78,7 +84,7 @@ mod tests {
                         .unwrap();
                     let (width, height) = frame.size;
                     assert_eq!(frame.vframe.len(), (width * height * 4) as usize);
-                    check_ts(frame.ts, &mut last_ts);
+                    check_ts(frame.ts, &mut last_video_ts);
                     nb_frames += 1;
                 }
             }
@@ -94,7 +100,8 @@ mod tests {
         );
     }
 
-    /// Video and audio share one monotonic clock, so one running maximum covers both.
+    /// Each stream's timestamps are monotonic; across the two channels they are not, so
+    /// every stream gets its own running maximum.
     fn check_ts(ts: u64, last: &mut u64) {
         assert!(ts > 0, "frame has no timestamp");
         assert!(ts >= *last, "timestamp went backwards: {ts} after {last}");

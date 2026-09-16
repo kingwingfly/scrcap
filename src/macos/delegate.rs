@@ -35,6 +35,7 @@ use crate::{
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
+    util::pack_rows,
 };
 
 #[derive(Debug)]
@@ -71,9 +72,6 @@ define_class!(
                     .unwrap_or_else(|| cm_time_ns(CMClock::host_time_clock().time()).unwrap_or(0));
                 match r#type {
                     SCStreamOutputType::Screen => {
-                        if !self.ivars().gate.lock().allow(ts) {
-                            return;
-                        }
                         let Some(buffer) = sample_buffer.image_buffer() else {
                             return;
                         };
@@ -87,28 +85,21 @@ define_class!(
                         let height = CVPixelBufferGetHeight(&buffer);
                         let addr = CVPixelBufferGetBaseAddress(&buffer);
                         let row_bytes = width * 4;
-                        let vframe = if addr.is_null() || bytes_per_row < row_bytes {
+                        if addr.is_null()
+                            || bytes_per_row < row_bytes
+                            || !self.ivars().gate.lock().allow(ts)
+                        {
                             CVPixelBufferUnlockBaseAddress(
                                 &buffer,
                                 CVPixelBufferLockFlags::ReadOnly,
                             );
                             return;
-                        } else if bytes_per_row == row_bytes {
-                            core::slice::from_raw_parts(addr as *const u8, row_bytes * height)
-                                .to_vec()
-                        } else {
-                            let padded = core::slice::from_raw_parts(
-                                addr as *const u8,
-                                bytes_per_row * height,
-                            );
-                            let mut packed = Vec::with_capacity(row_bytes * height);
-                            for row in 0..height {
-                                let start = row * bytes_per_row;
-                                packed.extend_from_slice(&padded[start..start + row_bytes]);
-                            }
-                            packed
-                        };
+                        }
+                        let vframe = pack_rows(addr as *const u8, bytes_per_row, row_bytes, height);
                         CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::ReadOnly);
+                        let Some(vframe) = vframe else {
+                            return;
+                        };
                         *self.ivars().size.lock() = (width as u32, height as u32);
                         let _ = self.ivars().v_tx.try_send(VideoFrame {
                             vframe,

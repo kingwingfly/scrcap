@@ -2,17 +2,14 @@
 
 use std::{
     fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     thread::{self, JoinHandle},
 };
 
 use crossbeam_channel::Sender;
 use tracing::error;
 
-use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
+use parking_lot::Mutex;
 use pipewire::{
     channel::Sender as PwSender,
     context::ContextRc,
@@ -58,7 +55,6 @@ struct VideoData {
     mainloop: MainLoopRc,
     gate: FpsGate,
     format: VideoInfoRaw,
-    size_guard: Option<ArcMutexGuard<RawMutex, (u32, u32)>>,
     size: Arc<Mutex<(u32, u32)>>,
     /// Answered from the format callback, so `new` only returns once the size is real.
     setup_tx: Option<Sender<Result<()>>>,
@@ -73,7 +69,6 @@ struct AudioData {
 pub struct PipewireSession {
     jh: Option<JoinHandle<()>>,
     quit_tx: PwSender<Terminate>,
-    pub terminate: Arc<AtomicBool>,
     pub size: Arc<Mutex<(u32, u32)>>,
     pub sample_rate: Option<Arc<Mutex<Option<i32>>>>,
 }
@@ -81,7 +76,6 @@ pub struct PipewireSession {
 impl fmt::Debug for PipewireSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PipewireSession")
-            .field("terminate", &self.terminate)
             .field("size", &self.size)
             .field("sample_rate", &self.sample_rate)
             .finish_non_exhaustive()
@@ -111,15 +105,12 @@ impl PipewireSession {
         let max_framerate = fps.filter(|fps| *fps > 0).unwrap_or(1000);
         let size = Arc::new(Mutex::new((0, 0)));
         let sample_rate = audio.as_ref().map(|_audio| Arc::new(Mutex::new(None)));
-        let terminate = Arc::new(AtomicBool::new(false));
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         let (setup_tx, setup_rx) = crossbeam_channel::bounded::<Result<()>>(1);
 
         let jh = thread::spawn({
-            let terminate = terminate.clone();
             let size = size.clone();
             let sample_rate = sample_rate.clone();
-            let size_guard = size.lock_arc();
             let setup_tx = setup_tx.clone();
             move || {
                 let run = || -> Result<()> {
@@ -153,7 +144,6 @@ impl PipewireSession {
                         mainloop: mainloop.clone(),
                         gate: FpsGate::new(fps),
                         format: VideoInfoRaw::new(),
-                        size_guard: Some(size_guard),
                         size,
                         setup_tx: Some(setup_tx.clone()),
                     };
@@ -285,7 +275,6 @@ impl PipewireSession {
                 if let Err(e) = run() {
                     let _ = setup_tx.try_send(Err(e));
                 }
-                terminate.store(true, Ordering::Relaxed);
             }
         });
         drop(setup_tx);
@@ -308,7 +297,6 @@ impl PipewireSession {
             jh: Some(jh),
             quit_tx,
             size,
-            terminate,
             sample_rate,
         })
     }
@@ -322,7 +310,6 @@ impl PipewireSession {
     }
 
     pub fn terminate(&self) {
-        self.terminate.store(true, Ordering::Relaxed);
         let _ = self.quit_tx.send(Terminate);
     }
 }
@@ -482,11 +469,7 @@ fn video_param_change_callback(
         return;
     }
     let size = data.format.size();
-    if let Some(mut size_guard) = data.size_guard.take() {
-        *size_guard = (size.width, size.height);
-    } else {
-        *data.size.lock() = (size.width, size.height);
-    }
+    *data.size.lock() = (size.width, size.height);
     if let Some(setup_tx) = data.setup_tx.take() {
         let _ = setup_tx.try_send(Ok(()));
     }

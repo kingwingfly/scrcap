@@ -69,7 +69,6 @@ impl CaptureConfig {
 
         let jh = thread::spawn({
             let size = size.clone();
-            let mut size_guard = size.lock_arc();
             let sample_rate = audio_desc.as_ref().map(|desc| desc.sample_rate.clone());
             let target = self.video.target.clone();
             move || unsafe {
@@ -127,6 +126,8 @@ impl CaptureConfig {
                         &stream_config,
                         Some(ProtocolObject::from_ref(&*stream_delegate)),
                     );
+                    // Before the output exists, so a real frame's size always lands after it.
+                    *size.lock() = (width as u32, height as u32);
                     let output_delegrate =
                         VideoStreamOutput::new(v_tx, a_tx, size, sample_rate, self.video.fps);
                     let video_queue =
@@ -162,8 +163,6 @@ impl CaptureConfig {
                         Ok(None) => {}
                         Err(_) => return Err(CaptureError::WorkerGone),
                     }
-                    *size_guard = (width as u32, height as u32);
-                    drop(size_guard); // Drop size_guard, the main thread continues
                     Ok((stream, output_delegrate, has_audio))
                 };
 
@@ -209,7 +208,6 @@ impl CaptureConfig {
         });
 
         let setup = setup_rx.recv().unwrap_or(Err(CaptureError::WorkerGone));
-        let _ = *size.lock(); // Guard in screen capture dropped -> capture started
         if let Err(e) = setup {
             let _ = jh.join();
             return Err(e);

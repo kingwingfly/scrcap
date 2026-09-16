@@ -562,6 +562,9 @@ struct Loopback {
     /// One sample of every channel.
     frame_bytes: usize,
     buffer_frames: u32,
+    /// The endpoint's default period in nanoseconds: loopback hands packets over one period
+    /// after the QPC time they are stamped with.
+    device_period: u64,
     // Must stay last: fields drop in order, and the interfaces above have to be released
     // while their apartment still exists.
     _com: ComApartment,
@@ -594,6 +597,8 @@ impl Loopback {
             init?;
             let sample_fmt = sample_fmt.ok_or(Unsupported::SampleFormat)?;
             let buffer_frames = audio_client.GetBufferSize()?;
+            let mut device_period = 0i64;
+            audio_client.GetDevicePeriod(Some(&mut device_period), None)?;
             let capture_client: IAudioCaptureClient = audio_client.GetService()?;
             audio_client.Start()?;
             Ok(Self {
@@ -604,6 +609,11 @@ impl Loopback {
                 sample_fmt,
                 frame_bytes: nb_channels as usize * (bits_per_sample / 8),
                 buffer_frames,
+                // 100 ns units; 10 ms is the shared-mode default if the driver reports none.
+                device_period: u64::try_from(device_period)
+                    .ok()
+                    .filter(|period| *period > 0)
+                    .map_or(10_000_000, |period| period * 100),
                 _com: com,
             })
         }
@@ -625,6 +635,11 @@ impl Loopback {
             SampleFmt::U8 => 128u8,
             _ => 0,
         };
+        // A packet is readable only a period (plus scheduling latency) after the time it is
+        // stamped with, so an empty poll proves nothing about the most recent periods. Filling
+        // silence right up to now would cover time the next real packet is stamped in, and
+        // that packet would then have to be pushed later than it was captured.
+        let settled = 3 * self.device_period;
         let poll_bytes = (self.sample_rate as u64 * poll.as_nanos() as u64 / 1_000_000_000 + 1)
             as usize
             * self.frame_bytes;
@@ -664,7 +679,7 @@ impl Loopback {
                 unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
             }
             if aframe.is_empty() {
-                let gap = qpc_now().saturating_sub(next_ts);
+                let gap = qpc_now().saturating_sub(settled).saturating_sub(next_ts);
                 nb_samples = (gap as u128 * self.sample_rate as u128 / 1_000_000_000)
                     .min(self.sample_rate as u128) as u32;
                 if nb_samples == 0 {
@@ -786,9 +801,7 @@ impl Drop for CaptureVideoDesc {
         if let Some(jh) = self.jh.take() {
             let _ = jh.join();
         }
-        for (hwnd, previous) in self.hidden.drain(..) {
-            restore_window_capture_affinity(HWND(hwnd as _), previous);
-        }
+        restore_hidden(&self.hidden);
     }
 }
 

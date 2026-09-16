@@ -19,7 +19,7 @@ use crossbeam_channel::{Receiver, bounded};
 use crossbeam_utils::sync::{Parker, Unparker};
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::{
-    AnyThread as _, ClassType as _,
+    AnyThread as _,
     rc::Retained,
     runtime::{AnyClass, ProtocolObject},
     sel,
@@ -29,7 +29,7 @@ use objc2_foundation::{NSArray, NSError, NSNumber, NSObjectProtocol as _};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCContentSharingPicker, SCContentSharingPickerConfiguration, SCDisplay,
     SCShareableContent, SCShareableContentStyle, SCStream, SCStreamConfiguration,
-    SCStreamConfigurationPreset, SCStreamOutputType, SCWindow,
+    SCStreamOutputType, SCWindow,
 };
 use parking_lot::Mutex;
 use regex::Regex;
@@ -76,7 +76,13 @@ impl CaptureConfig {
                 let stopped = Arc::new(AtomicBool::new(false));
                 // The delegate answers this too, so the wait below never needs a timeout.
                 let (stop_tx, stop_rx) = bounded::<Option<CaptureError>>(1);
-                let run = || -> Result<(Retained<SCStream>, Retained<VideoStreamOutput>, bool)> {
+                #[allow(clippy::type_complexity)]
+                let run = || -> Result<(
+                    Retained<SCStream>,
+                    Retained<StreamDelegate>,
+                    Retained<VideoStreamOutput>,
+                    bool,
+                )> {
                     let (filter, width, height) = if target == Target::Pick {
                         present_picker(&excluded)?
                     } else {
@@ -84,16 +90,9 @@ impl CaptureConfig {
                         content_filter(&content, &target, re.as_ref(), &excluded)?
                     };
 
-                    let stream_config = if SCStreamConfiguration::class()
-                        .metaclass()
-                        .responds_to(sel!(streamConfigurationWithPreset:))
-                    {
-                        SCStreamConfiguration::streamConfigurationWithPreset(
-                            SCStreamConfigurationPreset::CaptureHDRScreenshotLocalDisplay,
-                        )
-                    } else {
-                        SCStreamConfiguration::new()
-                    };
+                    // Deliberately no preset: the HDR ones change the dynamic range and colour
+                    // space, which 8-bit BGRA cannot carry, and only exist on macOS 15.
+                    let stream_config = SCStreamConfiguration::new();
                     stream_config.setWidth(width);
                     stream_config.setHeight(height);
                     // macOS 13+; on 12.3 the selector is missing and sending it aborts.
@@ -163,10 +162,13 @@ impl CaptureConfig {
                         Ok(None) => {}
                         Err(_) => return Err(CaptureError::WorkerGone),
                     }
-                    Ok((stream, output_delegrate, has_audio))
+                    Ok((stream, stream_delegate, output_delegrate, has_audio))
                 };
 
-                let (stream, output_delegrate, has_audio) = match run() {
+                // `stream_delegate` is held to the end: ScreenCaptureKit does not keep its
+                // delegate alive, and without it a stream that stops itself -- Stop Sharing,
+                // an unplugged display -- would never unpark this thread or answer `stop_rx`.
+                let (stream, stream_delegate, output_delegrate, has_audio) = match run() {
                     Ok(v) => {
                         let _ = setup_tx.send(Ok(()));
                         v
@@ -203,6 +205,7 @@ impl CaptureConfig {
                 if let Ok(Some(e)) = stop_rx.recv() {
                     error!("failed to stop capture: {e}");
                 }
+                drop(stream_delegate);
                 Ok(())
             }
         });
@@ -329,6 +332,13 @@ unsafe fn filter_size(filter: &SCContentFilter) -> Option<(usize, usize)> {
     }
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    /// The `CGDirectDisplayID` of the display with the menu bar, the one `SCDisplay::displayID`
+    /// matches for `Target::Primary`.
+    safe fn CGMainDisplayID() -> u32;
+}
+
 unsafe fn content_filter(
     shareable: &SCShareableContent,
     target: &Target,
@@ -356,9 +366,11 @@ unsafe fn content_filter(
             )
         };
         let filter = match target {
+            // `displays` has no documented order, so the first one is not necessarily main.
             Target::Primary => shareable
                 .displays()
-                .firstObject()
+                .iter()
+                .find(|display| display.displayID() == CGMainDisplayID())
                 .map(|display| from_display(&display)),
             Target::Monitor(index) => usize::try_from(*index)
                 .ok()

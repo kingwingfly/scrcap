@@ -12,7 +12,6 @@ use crate::{
 };
 
 use std::{
-    iter::repeat_with,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -56,7 +55,8 @@ impl CaptureConfig {
                         thread::sleep(Duration::from_millis(1));
                         continue;
                     }
-                    let vframe = repeat_with(|| rng.random()).take(num_bytes).collect();
+                    let mut vframe = vec![0u8; num_bytes];
+                    rng.fill(&mut vframe[..]);
                     let _ = tx.try_send(VideoFrame {
                         vframe,
                         size: (WIDTH, HEIGHT),

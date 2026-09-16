@@ -29,8 +29,8 @@ use pipewire::{
         },
         sys::{
             SPA_CHUNK_FLAG_CORRUPTED, SPA_META_Header, SPA_PARAM_META_size, SPA_PARAM_META_type,
-            SPA_PARAM_Meta, SPA_TYPE_OBJECT_ParamMeta, SPA_VIDEO_FORMAT_BGRA, spa_buffer,
-            spa_chunk, spa_data, spa_meta_header,
+            SPA_PARAM_Meta, SPA_TYPE_OBJECT_ParamMeta, spa_buffer, spa_chunk, spa_data,
+            spa_meta_header,
         },
         utils::{Direction, Fraction, SpaTypes},
     },
@@ -55,8 +55,11 @@ struct VideoData {
     mainloop: MainLoopRc,
     gate: FpsGate,
     format: VideoInfoRaw,
+    /// What the negotiated `format` is called here; only meaningful once it is set.
+    pix_fmt: PixFmt,
     size: Arc<Mutex<(u32, u32)>>,
-    /// Answered from the format callback, so `new` only returns once the size is real.
+    /// Answered from the format callback, so `new` only returns once the size is real, or
+    /// from the state callback if the stream fails before that.
     setup_tx: Option<Sender<Result<()>>>,
 }
 
@@ -144,6 +147,7 @@ impl PipewireSession {
                         mainloop: mainloop.clone(),
                         gate: FpsGate::new(fps),
                         format: VideoInfoRaw::new(),
+                        pix_fmt: PixFmt::Bgra,
                         size,
                         setup_tx: Some(setup_tx.clone()),
                     };
@@ -164,8 +168,14 @@ impl PipewireSession {
                         property! {
                             FormatProperties::MediaSubtype, Id, MediaSubtype::Raw
                         },
+                        // BGRx too: wlroots-based portals offer only that for an XRGB8888
+                        // output. BGRA stays the default, so a producer with both keeps alpha.
                         property! {
-                            FormatProperties::VideoFormat, Id, VideoFormat(SPA_VIDEO_FORMAT_BGRA)
+                            FormatProperties::VideoFormat,
+                            Choice, Enum, Id,
+                            VideoFormat::BGRA,
+                            VideoFormat::BGRA,
+                            VideoFormat::BGRx
                         },
                         property! {
                             FormatProperties::VideoMaxFramerate,
@@ -263,7 +273,9 @@ impl PipewireSession {
                                 | StreamFlags::RT_PROCESS,
                             &mut params,
                         )?;
-                        Some((audio_stream, audio_listener))
+                        // Listener first: tuple fields drop in order, and a listener
+                        // dropped after its stream unlinks its hook from freed memory.
+                        Some((audio_listener, audio_stream))
                     } else {
                         None
                     };
@@ -396,7 +408,7 @@ fn video_process_callback(stream: &Stream, data: &mut VideoData) {
         if !(*buffer).buffer.is_null() {
             let spa_buffer = &*(*buffer).buffer;
             let ts = buffer_ts(spa_buffer);
-            if spa_buffer.n_datas >= 1 && data.gate.allow(ts) {
+            if spa_buffer.n_datas >= 1 {
                 let size = data.format.size();
                 let plane = spa_buffer.datas; // first elem
                 let chunk = &*(*plane).chunk;
@@ -408,22 +420,26 @@ fn video_process_callback(stream: &Stream, data: &mut VideoData) {
                 };
                 let height = size.height as usize;
                 let want = stride.saturating_mul(height);
-                let Some((base, avail)) = chunk_slice(*plane, chunk) else {
+                // Validate before the gate: an unusable buffer must not spend the slot
+                // the next real frame needs.
+                let usable = chunk_slice(*plane, chunk)
+                    .filter(|&(_, avail)| want != 0 && avail >= want && stride >= row_bytes);
+                let Some((base, _)) = usable else {
                     stream.queue_raw_buffer(buffer);
                     return;
                 };
-                let Some(vframe) = (if want == 0 || avail < want {
-                    None
-                } else {
-                    pack_rows(base, stride, row_bytes, height)
-                }) else {
+                if !data.gate.allow(ts) {
+                    stream.queue_raw_buffer(buffer);
+                    return;
+                }
+                let Some(vframe) = pack_rows(base, stride, row_bytes, height) else {
                     stream.queue_raw_buffer(buffer);
                     return;
                 };
                 let _ = data.tx.try_send(VideoFrame {
                     vframe,
                     size: (size.width, size.height),
-                    pix_fmt: PixFmt::Bgra,
+                    pix_fmt: data.pix_fmt,
                     ts,
                 });
             }
@@ -434,6 +450,9 @@ fn video_process_callback(stream: &Stream, data: &mut VideoData) {
 
 /// Leave the loop when the stream ends on its own, so the senders drop and a consumer's
 /// `recv` reports that the capture is over instead of blocking forever.
+///
+/// Before a format is agreed `create` is still waiting, so it is told why rather than left
+/// to find the channel closed.
 fn video_state_change_callback(
     _stream: &Stream,
     data: &mut VideoData,
@@ -441,13 +460,14 @@ fn video_state_change_callback(
     new: StreamState,
 ) {
     match new {
-        StreamState::Error(e) => {
-            error!("pipewire stream error: {e}");
-            data.mainloop.quit();
-        }
-        StreamState::Unconnected => data.mainloop.quit(),
-        _ => {}
+        StreamState::Error(e) => error!("pipewire stream error: {e}"),
+        StreamState::Unconnected => {}
+        _ => return,
     }
+    if let Some(setup_tx) = data.setup_tx.take() {
+        let _ = setup_tx.try_send(Err(CaptureError::StreamFailed));
+    }
+    data.mainloop.quit();
 }
 
 fn video_param_change_callback(
@@ -468,6 +488,10 @@ fn video_param_change_callback(
     if data.format.parse(param).is_err() {
         return;
     }
+    data.pix_fmt = match data.format.format() {
+        VideoFormat::BGRx => PixFmt::Bgr0,
+        _ => PixFmt::Bgra,
+    };
     let size = data.format.size();
     *data.size.lock() = (size.width, size.height);
     if let Some(setup_tx) = data.setup_tx.take() {

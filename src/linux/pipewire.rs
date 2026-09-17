@@ -115,7 +115,6 @@ impl PipewireSession {
         let jh = thread::spawn({
             let size = size.clone();
             let sample_rate = sample_rate.clone();
-            let setup_tx = setup_tx.clone();
             move || {
                 let run = || -> Result<()> {
                     let dbus = DbusScreen::new()?;
@@ -133,10 +132,6 @@ impl PipewireSession {
                         move |_| mainloop.quit()
                     });
 
-                    // Stopping the share from the desktop destroys the portal's node, which
-                    // only pauses this stream -- `Unconnected` never comes -- so the node's
-                    // removal is what ends the capture. Listener before registry: locals drop
-                    // in reverse order.
                     let registry = core.get_registry_rc()?;
                     let _node_listener = registry
                         .add_listener_local()
@@ -295,7 +290,6 @@ impl PipewireSession {
                 }
             }
         });
-        drop(setup_tx);
 
         // Every sender lives on the capture thread, so a session that dies before it
         // negotiates closes the channel instead of reporting a size of (0, 0).

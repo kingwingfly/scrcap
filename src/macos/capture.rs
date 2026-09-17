@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -32,12 +32,12 @@ use objc2_screen_capture_kit::{
     SCShareableContent, SCShareableContentStyle, SCStream, SCStreamConfiguration,
     SCStreamOutputType, SCWindow,
 };
-use parking_lot::Mutex;
 use regex::Regex;
 use tracing::error;
 
 impl CaptureConfig {
-    /// Spawns a thread to capture the screen and returns a `CaptureDesc` that can be used to control the capture.
+    /// Spawns a thread to capture the screen and returns a `CaptureDesc`
+    /// that can be used to control the capture.
     pub fn create(self) -> Result<CaptureDesc> {
         self.validate()?;
         let re = match &self.video.target {
@@ -53,11 +53,11 @@ impl CaptureConfig {
             }
             None => (None, None),
         };
-        let size = Arc::new(Mutex::new((0, 0)));
+        let size = Arc::new(AtomicU64::new(0));
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
         let audio_desc = self.audio.as_ref().map(|_| CaptureAudioDesc {
-            sample_rate: Arc::new(Mutex::new(None)),
+            sample_rate: Arc::new(AtomicI32::new(0)),
         });
         let excluded: Vec<u32> = self
             .video
@@ -73,7 +73,6 @@ impl CaptureConfig {
             let sample_rate = audio_desc.as_ref().map(|desc| desc.sample_rate.clone());
             let target = self.video.target.clone();
             move || unsafe {
-                // Set by the stream delegate when the stream stops itself.
                 let stopped = Arc::new(AtomicBool::new(false));
                 // The delegate answers this too, so the wait below never needs a timeout.
                 let (stop_tx, stop_rx) = bounded::<Option<CaptureError>>(1);
@@ -127,7 +126,7 @@ impl CaptureConfig {
                         Some(ProtocolObject::from_ref(&*stream_delegate)),
                     );
                     // Before the output exists, so a real frame's size always lands after it.
-                    *size.lock() = (width as u32, height as u32);
+                    size.store((width as u64) << 32 | height as u64, Ordering::Relaxed);
                     let output_delegrate =
                         VideoStreamOutput::new(v_tx, a_tx, size, sample_rate, self.video.fps);
                     let video_queue =
@@ -426,23 +425,24 @@ pub struct CaptureDesc {
 
 #[derive(Debug)]
 struct CaptureVideoDesc {
-    size: Arc<Mutex<(u32, u32)>>,
+    size: Arc<AtomicU64>,
 }
 
 impl CaptureVideoDesc {
     fn size(&self) -> (u32, u32) {
-        *self.size.lock()
+        let packed = self.size.load(Ordering::Relaxed);
+        ((packed >> 32) as u32, (packed & 0xFFFFFFFF) as u32)
     }
 }
 
 #[derive(Debug)]
 struct CaptureAudioDesc {
-    sample_rate: Arc<Mutex<Option<i32>>>,
+    sample_rate: Arc<AtomicI32>,
 }
 
 impl CaptureAudioDesc {
-    fn sample_rate(&self) -> Option<i32> {
-        *self.sample_rate.lock()
+    fn sample_rate(&self) -> i32 {
+        self.sample_rate.load(Ordering::Relaxed)
     }
 }
 
@@ -474,7 +474,7 @@ impl CaptureDescriptor for CaptureDesc {
     fn sample_rate(&self) -> Option<i32> {
         self.audio_desc
             .as_ref()
-            .and_then(|audio_desc| audio_desc.sample_rate())
+            .map(|audio_desc| audio_desc.sample_rate())
     }
 }
 

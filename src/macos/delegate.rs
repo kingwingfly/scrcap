@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
 };
 
 use crossbeam_channel::Sender;
@@ -43,10 +43,9 @@ pub(crate) struct StreamOutput {
     v_tx: Sender<VideoFrame>,
     a_tx: Option<Sender<AudioFrame>>,
     gate: Mutex<FpsGate>,
-    size: Arc<Mutex<(u32, u32)>>,
-    /// The last size written to `size`, packed as `width << 32 | height`.
-    last_size: AtomicU64,
-    sample_rate: Option<Arc<Mutex<Option<i32>>>>,
+    /// packed as `width << 32 | height`.
+    size: Arc<AtomicU64>,
+    sample_rate: Option<Arc<AtomicI32>>,
 }
 
 define_class!(
@@ -107,9 +106,7 @@ define_class!(
                             return;
                         };
                         let packed = (width as u64) << 32 | height as u64;
-                        if self.ivars().last_size.swap(packed, Ordering::Relaxed) != packed {
-                            *self.ivars().size.lock() = (width as u32, height as u32);
-                        }
+                        self.ivars().size.store(packed, Ordering::Relaxed);
                         let _ = self.ivars().v_tx.try_send(VideoFrame {
                             vframe,
                             size: (width as u32, height as u32),
@@ -135,8 +132,9 @@ define_class!(
                         if rate <= 0 || asbd.mChannelsPerFrame == 0 {
                             return;
                         }
+
                         if let Some(sample_rate) = self.ivars().sample_rate.as_ref() {
-                            *sample_rate.lock() = Some(rate);
+                            sample_rate.store(rate, Ordering::Relaxed);
                         }
                         let Some(aframe) = copy_audio_planes(sample_buffer) else {
                             return;
@@ -267,8 +265,8 @@ impl VideoStreamOutput {
     pub(crate) fn new(
         v_tx: Sender<VideoFrame>,
         a_tx: Option<Sender<AudioFrame>>,
-        size: Arc<Mutex<(u32, u32)>>,
-        sample_rate: Option<Arc<Mutex<Option<i32>>>>,
+        size: Arc<AtomicU64>,
+        sample_rate: Option<Arc<AtomicI32>>,
         fps: Option<u32>,
     ) -> Retained<Self> {
         unsafe {
@@ -277,7 +275,6 @@ impl VideoStreamOutput {
                 a_tx,
                 gate: Mutex::new(FpsGate::new(fps)),
                 size,
-                last_size: AtomicU64::new(0),
                 sample_rate,
             });
             msg_send![super(this), init]

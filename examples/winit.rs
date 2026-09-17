@@ -228,10 +228,6 @@ impl State {
         let window = Arc::new(window);
         let size = window.inner_size();
 
-        // The instance is a handle to our GPU
-        // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
-        // `Backends::PRIMARY` never uses the display handle (it only matters for GLES
-        // on Wayland), so the no-display-handle defaults are what we want here.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -240,22 +236,10 @@ impl State {
         let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await?;
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: Default::default(),
-                trace: wgpu::Trace::Off,
-            })
+            .request_device(&wgpu::DeviceDescriptor::default())
             .await?;
 
         let surface_caps = surface.get_capabilities(&adapter);
@@ -428,7 +412,6 @@ impl State {
 
     /// Returns false once the capture has ended, so the caller can leave the event loop.
     fn render(&mut self) -> bool {
-        info!("Rendering frame");
         self.window.request_redraw();
 
         // We can't render unless the surface is configured

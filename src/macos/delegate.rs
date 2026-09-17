@@ -74,6 +74,10 @@ define_class!(
                     .unwrap_or_else(|| cm_time_ns(CMClock::host_time_clock().time()).unwrap_or(0));
                 match r#type {
                     SCStreamOutputType::Screen => {
+                        // A full channel would drop the frame anyway; do not lock or copy it.
+                        if self.ivars().v_tx.is_full() {
+                            return;
+                        }
                         let Some(buffer) = sample_buffer.image_buffer() else {
                             return;
                         };

@@ -19,6 +19,8 @@ use parking_lot::Mutex;
 use crate::error::{CaptureError, PortalCall, PortalError, Result};
 
 pub const SOURCE_TYPE_MONITOR: u32 = 1;
+/// `AvailableCursorModes` bit for a cursor drawn into the frames.
+const CURSOR_MODE_EMBEDDED: u32 = 2;
 
 /// A request in flight: the token that names it, the object path its `Response` signal was
 /// predicted to arrive on, and the slot that signal lands in.
@@ -143,7 +145,21 @@ impl DbusScreen {
         );
         map.insert(String::from("types"), Variant(Box::new(source_type)));
         map.insert(String::from("multiple"), Variant(Box::new(false)));
-        map.insert(String::from("cursor_mode"), Variant(Box::new(2u32)));
+        // The portal rejects a cursor mode its backend does not advertise, and a version 1
+        // portal has no such property at all; the cursor is then left at the default.
+        let cursor_modes = proxy
+            .method_call(
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                ("org.freedesktop.portal.ScreenCast", "AvailableCursorModes"),
+            )
+            .map_or(0, |r: (Variant<u32>,)| (r.0).0);
+        if cursor_modes & CURSOR_MODE_EMBEDDED != 0 {
+            map.insert(
+                String::from("cursor_mode"),
+                Variant(Box::new(CURSOR_MODE_EMBEDDED)),
+            );
+        }
         let path = proxy
             .method_call(
                 "org.freedesktop.portal.ScreenCast",

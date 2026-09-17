@@ -56,8 +56,7 @@ use windows::{
         UI::Shell::IInitializeWithWindow,
         UI::WindowsAndMessaging::{
             DispatchMessageW, EnumWindows, GetMessageW, GetWindowTextW, IsWindowVisible, MSG,
-            PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WINDOW_DISPLAY_AFFINITY, WM_NULL,
-            WM_USER,
+            PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WM_NULL, WM_USER,
         },
     },
     core::{BOOL, HSTRING, IInspectable, Interface as _, factory},
@@ -66,7 +65,7 @@ use windows::{
 use regex::Regex;
 use tracing::error;
 
-use super::utils::{hide_window_from_capture, restore_window_capture_affinity};
+use super::utils::{hide_window_from_capture, unhide_window};
 use crate::{
     capture_desc::CaptureDescriptor,
     config::{AudioConfig, CaptureConfig, Target, VideoConfig},
@@ -202,9 +201,9 @@ fn winrt_device(d3d_device: &ID3D11Device) -> windows::core::Result<IDirect3DDev
     unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)? }.cast()
 }
 
-fn restore_hidden(hidden: &[(isize, WINDOW_DISPLAY_AFFINITY)]) {
-    for (hwnd, previous) in hidden {
-        restore_window_capture_affinity(HWND(*hwnd as _), *previous);
+fn restore_hidden(hidden: &[isize]) {
+    for hwnd in hidden {
+        unhide_window(HWND(*hwnd as _));
     }
 }
 
@@ -225,7 +224,7 @@ impl VideoConfig {
         for hide in &self.hide {
             let hwnd = HWND(*hide as _);
             match hide_window_from_capture(hwnd) {
-                Ok(previous) => hidden.push((*hide, previous)),
+                Ok(()) => hidden.push(*hide),
                 Err(e) => {
                     restore_hidden(&hidden);
                     return Err(e);
@@ -259,7 +258,7 @@ impl VideoConfig {
         let jh = thread::spawn(unsafe {
             let size = size.clone();
             let setup_tx = setup_tx.clone();
-            move || -> Result<()> {
+            move || {
                 let setup =
                     (|| -> Result<(Direct3D11CaptureFramePool, GraphicsCaptureSession, i64)> {
                         const FEATURE_FLAGS: [Direct3D::D3D_FEATURE_LEVEL; 2] =
@@ -335,7 +334,8 @@ impl VideoConfig {
                                     .ok()
                                     .and_then(|t| u64::try_from(t.Duration).ok())
                                     .map_or_else(qpc_now, |t| t * 100);
-                                if !gate.lock().allow(ts) {
+                                // A full channel would drop the frame anyway; skip the readback.
+                                if tx.is_full() || !gate.lock().allow(ts) {
                                     return Ok(());
                                 }
                                 let surface = frame.Surface()?;
@@ -438,7 +438,7 @@ impl VideoConfig {
                     }
                     Err(e) => {
                         let _ = setup_tx.send(Err(e));
-                        return Ok(());
+                        return;
                     }
                 };
 
@@ -457,7 +457,6 @@ impl VideoConfig {
                 }
                 let _ = pool.RemoveFrameArrived(token);
                 let _ = session.Close();
-                Ok(())
             }
         });
         drop(setup_tx);
@@ -648,12 +647,16 @@ impl Loopback {
         let mut flags = 0u32;
         let mut qpc = 0u64;
         let mut next_ts = qpc_now();
+        // Whether the timeline up to `next_ts` ends in silence made up here rather than in
+        // samples WASAPI delivered. True at the start, when nothing before it has been sent.
+        let mut ends_in_fabricated = true;
         while !terminate.load(Ordering::Relaxed) {
             match wake_rx.recv_timeout(poll) {
                 Err(RecvTimeoutError::Timeout) => {}
                 _ => break,
             }
-            let mut aframe = Vec::with_capacity(poll_bytes);
+            // Allocated only once there is something to send.
+            let mut aframe = Vec::new();
             let mut nb_samples = 0u32;
             let mut ts = None;
             while unsafe { self.capture_client.GetNextPacketSize()? } != 0 {
@@ -668,6 +671,9 @@ impl Loopback {
                 }
                 ts.get_or_insert(qpc * 100);
                 let packet_bytes = nb_frames as usize * self.frame_bytes;
+                if aframe.capacity() == 0 {
+                    aframe.reserve(poll_bytes);
+                }
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
                     aframe.extend_from_slice(unsafe {
                         core::slice::from_raw_parts(data, packet_bytes)
@@ -678,7 +684,8 @@ impl Loopback {
                 nb_samples += nb_frames;
                 unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
             }
-            if aframe.is_empty() {
+            let fabricated = aframe.is_empty();
+            if fabricated {
                 let gap = qpc_now().saturating_sub(settled).saturating_sub(next_ts);
                 nb_samples = (gap as u128 * self.sample_rate as u128 / 1_000_000_000)
                     .min(self.sample_rate as u128) as u32;
@@ -688,7 +695,27 @@ impl Loopback {
                 aframe.resize(nb_samples as usize * self.frame_bytes, silence);
                 ts = Some(next_ts);
             }
-            let ts = ts.map_or(next_ts, |ts| ts.max(next_ts));
+            let mut ts = ts.unwrap_or(next_ts);
+            if ts < next_ts {
+                if ends_in_fabricated {
+                    // The packet reaches back into time already sent as made-up silence, or
+                    // into time before the capture started. That cannot be taken back, and
+                    // stamping the packet late instead would make every contiguous packet
+                    // after it late too, since each continues from the one before. Drop the
+                    // overlap; interleaved samples trim from the front a frame at a time.
+                    let overlap = ((next_ts - ts) as u128 * self.sample_rate as u128 + 500_000_000)
+                        / 1_000_000_000;
+                    if overlap >= nb_samples as u128 {
+                        continue;
+                    }
+                    aframe.drain(..overlap as usize * self.frame_bytes);
+                    nb_samples -= overlap as u32;
+                }
+                // After real samples the overlap is only timestamp jitter: the stream is
+                // contiguous, so it continues exactly where the last frame ended.
+                ts = next_ts;
+            }
+            ends_in_fabricated = fabricated;
             next_ts = ts + (nb_samples as u128 * 1_000_000_000 / self.sample_rate as u128) as u64;
             match tx.try_send(AudioFrame {
                 aframe,
@@ -718,11 +745,9 @@ impl AudioConfig {
         tx: Sender<AudioFrame>,
         terminate: Arc<AtomicBool>,
     ) -> Result<CaptureAudioDesc> {
-        let sample_rate = Arc::new(Mutex::new(0));
         let (wake_tx, wake_rx) = bounded::<()>(1);
-        let (setup_tx, setup_rx) = bounded::<Result<()>>(1);
+        let (setup_tx, setup_rx) = bounded::<Result<i32>>(1);
         let jh = thread::spawn({
-            let sample_rate = sample_rate.clone();
             let terminate = terminate.clone();
             move || {
                 let loopback = match Loopback::start() {
@@ -732,16 +757,15 @@ impl AudioConfig {
                         return;
                     }
                 };
-                *sample_rate.lock() = loopback.sample_rate;
-                let _ = setup_tx.send(Ok(()));
+                let _ = setup_tx.send(Ok(loopback.sample_rate));
                 if let Err(e) = loopback.pump(&tx, &wake_rx, &terminate) {
                     error!("audio capture stopped: {e}");
                 }
             }
         });
 
-        match setup_rx.recv() {
-            Ok(Ok(())) => {}
+        let sample_rate = match setup_rx.recv() {
+            Ok(Ok(sample_rate)) => sample_rate,
             Ok(Err(e)) => {
                 let _ = jh.join();
                 return Err(e);
@@ -750,7 +774,7 @@ impl AudioConfig {
                 let _ = jh.join();
                 return Err(CaptureError::WorkerGone);
             }
-        }
+        };
         Ok(CaptureAudioDesc {
             sample_rate,
             jh: Some(jh),
@@ -775,10 +799,10 @@ pub struct CaptureDesc {
 #[derive(Debug)]
 struct CaptureVideoDesc {
     size: Arc<Mutex<(u32, u32)>>,
-    jh: Option<JoinHandle<Result<()>>>,
+    jh: Option<JoinHandle<()>>,
     thread_id: u32,
-    /// `HWND`s, and the affinity each had before being hidden.
-    hidden: Vec<(isize, WINDOW_DISPLAY_AFFINITY)>,
+    /// The `HWND`s this capture hid, each to be given back once.
+    hidden: Vec<isize>,
     terminate: Arc<AtomicBool>,
 }
 
@@ -807,7 +831,7 @@ impl Drop for CaptureVideoDesc {
 
 #[derive(Debug)]
 struct CaptureAudioDesc {
-    sample_rate: Arc<Mutex<i32>>,
+    sample_rate: i32,
     jh: Option<JoinHandle<()>>,
     wake_tx: Sender<()>,
     terminate: Arc<AtomicBool>,
@@ -815,7 +839,7 @@ struct CaptureAudioDesc {
 
 impl CaptureAudioDesc {
     pub fn sample_rate(&self) -> i32 {
-        *self.sample_rate.lock()
+        self.sample_rate
     }
 
     fn wake(&self) {

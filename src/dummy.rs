@@ -36,10 +36,12 @@ impl CaptureConfig {
         let mut gate = FpsGate::new(self.video.fps);
         let control = Arc::new(AtomicBool::new(false));
         let control_ = Arc::clone(&control);
+        // Taken before the spawn, so the first frame's `ts` is never 0 even on clocks whose
+        // tick is coarser than the few instructions before the first `elapsed`.
+        let start = Instant::now();
         std::thread::Builder::new()
             .name("Capture".to_string())
             .spawn(move || {
-                let start = Instant::now();
                 let mut rng = SmallRng::from_seed([42; 32]);
                 let num_bytes = WIDTH as usize * HEIGHT as usize * 4;
                 loop {

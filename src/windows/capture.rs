@@ -25,18 +25,20 @@ use windows::{
                 self, D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
             },
             Direct3D11::{
-                D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-                D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11Texture2D,
+                D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
+                ID3D11Device, ID3D11Texture2D,
             },
             Dxgi::IDXGIDevice,
             Gdi::{EnumDisplayMonitors, HDC, HMONITOR, MONITOR_DEFAULTTONULL, MonitorFromPoint},
         },
         Media::{
             Audio::{
-                AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-                IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-                WAVE_FORMAT_PCM, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
+                AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR,
+                AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient,
+                IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM,
+                WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
             },
             KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE},
             Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
@@ -65,7 +67,7 @@ use windows::{
 use regex::Regex;
 use tracing::error;
 
-use super::utils::{hide_window_from_capture, unhide_window};
+use super::utils::{HideToken, hide_window_from_capture, unhide_window};
 use crate::{
     capture_desc::CaptureDescriptor,
     config::{AudioConfig, CaptureConfig, Target, VideoConfig},
@@ -201,9 +203,9 @@ fn winrt_device(d3d_device: &ID3D11Device) -> windows::core::Result<IDirect3DDev
     unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)? }.cast()
 }
 
-fn restore_hidden(hidden: &[isize]) {
-    for hwnd in hidden {
-        unhide_window(HWND(*hwnd as _));
+fn restore_hidden(hidden: &[HideToken]) {
+    for token in hidden {
+        unhide_window(*token);
     }
 }
 
@@ -224,7 +226,7 @@ impl VideoConfig {
         for hide in &self.hide {
             let hwnd = HWND(*hide as _);
             match hide_window_from_capture(hwnd) {
-                Ok(()) => hidden.push(*hide),
+                Ok(token) => hidden.push(token),
                 Err(e) => {
                     restore_hidden(&hidden);
                     return Err(e);
@@ -343,16 +345,28 @@ impl VideoConfig {
                                 let texture = interface.GetInterface::<ID3D11Texture2D>()?;
                                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                                 texture.GetDesc(&mut desc);
+                                // This frame was allocated at the pool's *old* size, and only
+                                // the top-left `ContentSize` of it is defined, so a source that
+                                // has shrunk is cropped rather than copied whole. Recreating
+                                // the pool above only fixes the frames after this one.
+                                let crop = |content: i32, texture: u32| {
+                                    u32::try_from(content)
+                                        .ok()
+                                        .filter(|side| *side > 0)
+                                        .map_or(texture, |side| side.min(texture))
+                                };
+                                let width = crop(content.Width, desc.Width);
+                                let height = crop(content.Height, desc.Height);
 
                                 let mut staging = staging.lock();
                                 let cpu_texture = match staging.as_ref() {
-                                    Some((texture, w, h))
-                                        if *w == desc.Width && *h == desc.Height =>
-                                    {
+                                    Some((texture, w, h)) if *w == width && *h == height => {
                                         texture.clone()
                                     }
                                     _ => {
                                         let cpu_desc = D3D11_TEXTURE2D_DESC {
+                                            Width: width,
+                                            Height: height,
                                             Usage: D3D11_USAGE_STAGING,
                                             BindFlags: 0,
                                             CPUAccessFlags: (D3D11_CPU_ACCESS_READ
@@ -373,13 +387,28 @@ impl VideoConfig {
                                                 windows::Win32::Foundation::E_FAIL,
                                             )
                                         })?;
-                                        *staging =
-                                            Some((cpu_texture.clone(), desc.Width, desc.Height));
-                                        *size.lock() = (desc.Width, desc.Height);
+                                        *staging = Some((cpu_texture.clone(), width, height));
+                                        *size.lock() = (width, height);
                                         cpu_texture
                                     }
                                 };
-                                d3d_device_context.CopyResource(&cpu_texture, &texture);
+                                d3d_device_context.CopySubresourceRegion(
+                                    &cpu_texture,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    &texture,
+                                    0,
+                                    Some(&D3D11_BOX {
+                                        left: 0,
+                                        top: 0,
+                                        front: 0,
+                                        right: width,
+                                        bottom: height,
+                                        back: 1,
+                                    }),
+                                );
 
                                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                                 d3d_device_context.Map(
@@ -389,11 +418,11 @@ impl VideoConfig {
                                     0,
                                     Some(&mut mapped),
                                 )?;
-                                let row_bytes = desc.Width as usize * 4;
+                                let row_bytes = width as usize * 4;
                                 let pitch = mapped.RowPitch as usize;
-                                let height = desc.Height as usize;
+                                let rows = height as usize;
                                 let vframe =
-                                    pack_rows(mapped.pData as *const u8, pitch, row_bytes, height);
+                                    pack_rows(mapped.pData as *const u8, pitch, row_bytes, rows);
                                 d3d_device_context.Unmap(&cpu_texture, 0);
                                 drop(staging);
                                 let Some(vframe) = vframe else {
@@ -401,7 +430,7 @@ impl VideoConfig {
                                 };
                                 let _ = tx.try_send(VideoFrame {
                                     vframe,
-                                    size: (desc.Width, desc.Height),
+                                    size: (width, height),
                                     pix_fmt: PixFmt::Bgra,
                                     ts,
                                 });
@@ -639,26 +668,21 @@ impl Loopback {
         // silence right up to now would cover time the next real packet is stamped in, and
         // that packet would then have to be pushed later than it was captured.
         let settled = 3 * self.device_period;
-        let poll_bytes = (self.sample_rate as u64 * poll.as_nanos() as u64 / 1_000_000_000 + 1)
-            as usize
-            * self.frame_bytes;
         let mut data: *mut u8 = core::ptr::null_mut();
         let mut nb_frames = 0u32;
         let mut flags = 0u32;
         let mut qpc = 0u64;
-        let mut next_ts = qpc_now();
-        // Whether the timeline up to `next_ts` ends in silence made up here rather than in
-        // samples WASAPI delivered. True at the start, when nothing before it has been sent.
-        let mut ends_in_fabricated = true;
+        let mut line = Timeline {
+            next: qpc_now(),
+            // Nothing has been emitted, so nothing before `next` is a real sample either.
+            invented: true,
+        };
         while !terminate.load(Ordering::Relaxed) {
             match wake_rx.recv_timeout(poll) {
                 Err(RecvTimeoutError::Timeout) => {}
                 _ => break,
             }
-            // Allocated only once there is something to send.
-            let mut aframe = Vec::new();
-            let mut nb_samples = 0u32;
-            let mut ts = None;
+            let mut delivered = false;
             while unsafe { self.capture_client.GetNextPacketSize()? } != 0 {
                 unsafe {
                     self.capture_client.GetBuffer(
@@ -669,67 +693,101 @@ impl Loopback {
                         Some(&mut qpc),
                     )?;
                 }
-                ts.get_or_insert(qpc * 100);
                 let packet_bytes = nb_frames as usize * self.frame_bytes;
-                if aframe.capacity() == 0 {
-                    aframe.reserve(poll_bytes);
-                }
+                let mut aframe = Vec::with_capacity(packet_bytes);
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
                     aframe.extend_from_slice(unsafe {
                         core::slice::from_raw_parts(data, packet_bytes)
                     });
                 } else {
-                    aframe.resize(aframe.len() + packet_bytes, silence);
+                    aframe.resize(packet_bytes, silence);
                 }
-                nb_samples += nb_frames;
                 unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
+                // One frame per packet, each with its own capture time: two packets drained
+                // in the same poll may be a pause apart, and merging them would place the
+                // second one early. `TIMESTAMP_ERROR` means the position is not usable, and
+                // a frame with no usable time of its own simply continues the timeline --
+                // which is the same QPC domain, not a foreign clock.
+                let ts = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc != 0)
+                    .then_some(qpc * 100);
+                self.emit(tx, terminate, &mut line, aframe, nb_frames, ts, false);
+                delivered = true;
             }
-            let fabricated = aframe.is_empty();
-            if fabricated {
-                let gap = qpc_now().saturating_sub(settled).saturating_sub(next_ts);
-                nb_samples = (gap as u128 * self.sample_rate as u128 / 1_000_000_000)
-                    .min(self.sample_rate as u128) as u32;
-                if nb_samples == 0 {
-                    continue;
-                }
-                aframe.resize(nb_samples as usize * self.frame_bytes, silence);
-                ts = Some(next_ts);
+            if delivered {
+                continue;
             }
-            let mut ts = ts.unwrap_or(next_ts);
-            if ts < next_ts {
-                if ends_in_fabricated {
-                    // The packet reaches back into time already sent as made-up silence, or
-                    // into time before the capture started. That cannot be taken back, and
-                    // stamping the packet late instead would make every contiguous packet
-                    // after it late too, since each continues from the one before. Drop the
-                    // overlap; interleaved samples trim from the front a frame at a time.
-                    let overlap = ((next_ts - ts) as u128 * self.sample_rate as u128 + 500_000_000)
-                        / 1_000_000_000;
-                    if overlap >= nb_samples as u128 {
-                        continue;
-                    }
-                    aframe.drain(..overlap as usize * self.frame_bytes);
-                    nb_samples -= overlap as u32;
-                }
-                // After real samples the overlap is only timestamp jitter: the stream is
-                // contiguous, so it continues exactly where the last frame ended.
-                ts = next_ts;
+            // Loopback delivers nothing while no app is playing; the gap is made up here.
+            let gap = qpc_now().saturating_sub(settled).saturating_sub(line.next);
+            let nb_samples = (gap as u128 * self.sample_rate as u128 / 1_000_000_000)
+                .min(self.sample_rate as u128) as u32;
+            if nb_samples == 0 {
+                continue;
             }
-            ends_in_fabricated = fabricated;
-            next_ts = ts + (nb_samples as u128 * 1_000_000_000 / self.sample_rate as u128) as u64;
-            match tx.try_send(AudioFrame {
-                aframe,
-                nb_samples: nb_samples as i32,
-                sample_rate: self.sample_rate,
-                nb_channels: self.nb_channels,
-                sample_fmt: self.sample_fmt,
-                ts,
-            }) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => terminate.store(true, Ordering::Relaxed),
-            }
+            let aframe = vec![silence; nb_samples as usize * self.frame_bytes];
+            self.emit(tx, terminate, &mut line, aframe, nb_samples, None, true);
         }
         Ok(())
+    }
+}
+
+/// How far the emitted audio has reached, in the QPC domain, and how it got there.
+struct Timeline {
+    next: u64,
+    /// Whether the samples up to `next` end in silence [`Loopback::pump`] made up rather
+    /// than in samples WASAPI delivered.
+    invented: bool,
+}
+
+impl Loopback {
+    /// Send one frame, keeping the emitted timeline continuous.
+    ///
+    /// `ts` is the frame's own capture time where there is a usable one; without it the
+    /// frame continues where the last one ended.
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &self,
+        tx: &Sender<AudioFrame>,
+        terminate: &AtomicBool,
+        line: &mut Timeline,
+        mut aframe: Vec<u8>,
+        mut nb_samples: u32,
+        ts: Option<u64>,
+        invented: bool,
+    ) {
+        let mut ts = ts.unwrap_or(line.next);
+        if ts < line.next {
+            if line.invented {
+                // The frame reaches back into time already sent as made-up silence, or into
+                // time before the capture started. That cannot be taken back, and stamping
+                // the frame late instead would make every contiguous frame after it late
+                // too, since each continues from the one before. Drop the overlap;
+                // interleaved samples trim from the front one sample of every channel at a
+                // time.
+                let overlap = ((line.next - ts) as u128 * self.sample_rate as u128 + 500_000_000)
+                    / 1_000_000_000;
+                if overlap >= nb_samples as u128 {
+                    return;
+                }
+                aframe.drain(..overlap as usize * self.frame_bytes);
+                nb_samples -= overlap as u32;
+            }
+            // After real samples the overlap is only timestamp jitter: the stream is
+            // contiguous, so it continues exactly where the last frame ended.
+            ts = line.next;
+        }
+        line.invented = invented;
+        line.next = ts + (nb_samples as u128 * 1_000_000_000 / self.sample_rate as u128) as u64;
+        match tx.try_send(AudioFrame {
+            aframe,
+            nb_samples: nb_samples as i32,
+            sample_rate: self.sample_rate,
+            nb_channels: self.nb_channels,
+            sample_fmt: self.sample_fmt,
+            ts,
+        }) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => terminate.store(true, Ordering::Relaxed),
+        }
     }
 }
 
@@ -801,8 +859,8 @@ struct CaptureVideoDesc {
     size: Arc<Mutex<(u32, u32)>>,
     jh: Option<JoinHandle<()>>,
     thread_id: u32,
-    /// The `HWND`s this capture hid, each to be given back once.
-    hidden: Vec<isize>,
+    /// What this capture hid, each to be given back once.
+    hidden: Vec<HideToken>,
     terminate: Arc<AtomicBool>,
 }
 

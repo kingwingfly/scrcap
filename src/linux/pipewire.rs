@@ -64,7 +64,8 @@ struct VideoData {
 }
 
 struct AudioData {
-    tx: Sender<AudioFrame>,
+    /// Dropped when the stream ends, which closes the channel a consumer is waiting on.
+    tx: Option<Sender<AudioFrame>>,
     format: AudioInfoRaw,
     sample_rate: Arc<Mutex<Option<i32>>>,
 }
@@ -237,7 +238,7 @@ impl PipewireSession {
                             },
                         )?;
                         let audio_data = AudioData {
-                            tx: a_tx,
+                            tx: Some(a_tx),
                             format: AudioInfoRaw::new(),
                             sample_rate: sample_rate.expect("sample_rate exists when audio is on"),
                         };
@@ -245,6 +246,7 @@ impl PipewireSession {
                             .add_local_listener_with_user_data(audio_data)
                             .param_changed(audio_param_change_callback)
                             .process(audio_process_callback)
+                            .state_changed(audio_state_change_callback)
                             .register()?;
                         let obj = object! {
                             SpaTypes::ObjectParamFormat,
@@ -509,11 +511,31 @@ fn video_param_change_callback(
     }
 }
 
+/// Close the audio channel when its stream ends, so a consumer's `recv` reports that the
+/// audio is over. The video capture carries on: only this sender goes away.
+fn audio_state_change_callback(
+    _stream: &Stream,
+    data: &mut AudioData,
+    _old: StreamState,
+    new: StreamState,
+) {
+    match new {
+        StreamState::Error(e) => error!("pipewire audio stream error: {e}"),
+        StreamState::Unconnected => {}
+        _ => return,
+    }
+    data.tx.take();
+}
+
 fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
     let buffer = unsafe { stream.dequeue_raw_buffer() };
     if buffer.is_null() {
         return;
     }
+    let Some(tx) = data.tx.as_ref() else {
+        unsafe { stream.queue_raw_buffer(buffer) };
+        return;
+    };
     unsafe {
         if !(*buffer).buffer.is_null() {
             let spa_buffer = &*(*buffer).buffer;
@@ -545,7 +567,7 @@ fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
                                 .extend_from_slice(core::slice::from_raw_parts(base, plane_bytes));
                         }
                     }
-                    let _ = data.tx.try_send(AudioFrame {
+                    let _ = tx.try_send(AudioFrame {
                         aframe,
                         nb_samples: nb_samples as i32,
                         sample_rate: sample_rate as i32,

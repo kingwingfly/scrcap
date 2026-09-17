@@ -546,10 +546,17 @@ fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
                     stream.queue_raw_buffer(buffer);
                     return;
                 }
-                let n_datas = spa_buffer.n_datas as usize;
-                // One plane per channel, all the same length, so the shortest readable one
-                // sets the frame's sample count rather than misaligning the planes after it.
-                let plane_bytes = (0..n_datas)
+                // F32P is one plane per channel, so the frame carries exactly `nb_channels`
+                // of them: reading fewer would make `nb_channels` a lie about the payload
+                // and send a consumer that indexes plane `c` off the end of `aframe`.
+                let n_planes = nb_channels as usize;
+                if (spa_buffer.n_datas as usize) < n_planes {
+                    stream.queue_raw_buffer(buffer);
+                    return;
+                }
+                // All the planes are the same length, so the shortest readable one sets the
+                // frame's sample count rather than misaligning the planes after it.
+                let plane_bytes = (0..n_planes)
                     .map(|i| {
                         let plane = spa_buffer.datas.add(i);
                         chunk_slice(*plane, &*(*plane).chunk).map_or(0, |(_, avail)| avail)
@@ -559,8 +566,8 @@ fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
                 let nb_samples = plane_bytes / size_of::<f32>();
                 if nb_samples > 0 {
                     let plane_bytes = nb_samples * size_of::<f32>();
-                    let mut aframe = Vec::with_capacity(plane_bytes * n_datas);
-                    for i in 0..n_datas {
+                    let mut aframe = Vec::with_capacity(plane_bytes * n_planes);
+                    for i in 0..n_planes {
                         let plane = spa_buffer.datas.add(i);
                         if let Some((base, _)) = chunk_slice(*plane, &*(*plane).chunk) {
                             aframe

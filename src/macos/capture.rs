@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use super::delegate::{PickerObserver, StreamDelegate, VideoStreamOutput, ns_error};
@@ -202,8 +203,14 @@ impl CaptureConfig {
                         },
                     )));
                 }
-                if let Ok(Some(e)) = stop_rx.recv() {
-                    error!("failed to stop capture: {e}");
+                // Bounded, and not because the wait is expected to be slow: `stop_tx` is
+                // still held here, so the channel can never close, and a `stopCapture`
+                // whose completion block is simply dropped would park this thread for
+                // good -- with `CaptureDesc::drop` joining it, that hangs the caller.
+                match stop_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(Some(e)) => error!("failed to stop capture: {e}"),
+                    Ok(None) => {}
+                    Err(_) => error!("ScreenCaptureKit never answered the stop request"),
                 }
                 drop(stream_delegate);
             }

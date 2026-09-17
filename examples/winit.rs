@@ -236,7 +236,12 @@ impl State {
         let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            // Without `compatible_surface` an adapter that cannot present to this surface
+            // is a valid answer, and `get_capabilities` then reports no formats at all.
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            })
             .await?;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())

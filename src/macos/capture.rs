@@ -1,12 +1,13 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
+use super::AtomicSize;
 use super::delegate::{PickerObserver, StreamDelegate, VideoStreamOutput, ns_error};
 use crate::{
     capture_desc::CaptureDescriptor,
@@ -53,7 +54,7 @@ impl CaptureConfig {
             }
             None => (None, None),
         };
-        let size = Arc::new(AtomicU64::new(0));
+        let size = Arc::new(AtomicSize::default());
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
         let audio_desc = self.audio.as_ref().map(|_| CaptureAudioDesc {
@@ -126,7 +127,7 @@ impl CaptureConfig {
                         Some(ProtocolObject::from_ref(&*stream_delegate)),
                     );
                     // Before the output exists, so a real frame's size always lands after it.
-                    size.store((width as u64) << 32 | height as u64, Ordering::Relaxed);
+                    size.store(width as u32, height as u32);
                     let output_delegrate =
                         VideoStreamOutput::new(v_tx, a_tx, size, sample_rate, self.video.fps);
                     let video_queue =
@@ -425,13 +426,12 @@ pub struct CaptureDesc {
 
 #[derive(Debug)]
 struct CaptureVideoDesc {
-    size: Arc<AtomicU64>,
+    size: Arc<AtomicSize>,
 }
 
 impl CaptureVideoDesc {
     fn size(&self) -> (u32, u32) {
-        let packed = self.size.load(Ordering::Relaxed);
-        ((packed >> 32) as u32, (packed & 0xFFFFFFFF) as u32)
+        self.size.load()
     }
 }
 
@@ -441,8 +441,11 @@ struct CaptureAudioDesc {
 }
 
 impl CaptureAudioDesc {
-    fn sample_rate(&self) -> i32 {
-        self.sample_rate.load(Ordering::Relaxed)
+    /// `None` until the first audio buffer settles the format: `0` is the unset state of the
+    /// atomic, not a rate, and a caller is meant to tell the two apart.
+    fn sample_rate(&self) -> Option<i32> {
+        let rate = self.sample_rate.load(Ordering::Relaxed);
+        (rate > 0).then_some(rate)
     }
 }
 
@@ -474,7 +477,7 @@ impl CaptureDescriptor for CaptureDesc {
     fn sample_rate(&self) -> Option<i32> {
         self.audio_desc
             .as_ref()
-            .map(|audio_desc| audio_desc.sample_rate())
+            .and_then(|audio_desc| audio_desc.sample_rate())
     }
 }
 

@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI32, Ordering},
 };
 
 use crossbeam_channel::Sender;
@@ -30,6 +30,7 @@ use objc2_screen_capture_kit::{
 use parking_lot::Mutex;
 use tracing::error;
 
+use super::AtomicSize;
 use crate::{
     error::{CaptureError, Result, ScreenCaptureKitError},
     format::{PixFmt, SampleFmt},
@@ -43,8 +44,7 @@ pub(crate) struct StreamOutput {
     v_tx: Sender<VideoFrame>,
     a_tx: Option<Sender<AudioFrame>>,
     gate: Mutex<FpsGate>,
-    /// packed as `width << 32 | height`.
-    size: Arc<AtomicU64>,
+    size: Arc<AtomicSize>,
     sample_rate: Option<Arc<AtomicI32>>,
 }
 
@@ -105,8 +105,7 @@ define_class!(
                         let Some(vframe) = vframe else {
                             return;
                         };
-                        let packed = (width as u64) << 32 | height as u64;
-                        self.ivars().size.store(packed, Ordering::Relaxed);
+                        self.ivars().size.store(width as u32, height as u32);
                         let _ = self.ivars().v_tx.try_send(VideoFrame {
                             vframe,
                             size: (width as u32, height as u32),
@@ -265,7 +264,7 @@ impl VideoStreamOutput {
     pub(crate) fn new(
         v_tx: Sender<VideoFrame>,
         a_tx: Option<Sender<AudioFrame>>,
-        size: Arc<AtomicU64>,
+        size: Arc<AtomicSize>,
         sample_rate: Option<Arc<AtomicI32>>,
         fps: Option<u32>,
     ) -> Retained<Self> {

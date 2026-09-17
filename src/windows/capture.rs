@@ -13,10 +13,11 @@ use windows::{
     Foundation::{Metadata::ApiInformation, TimeSpan, TypedEventHandler},
     Graphics::{
         Capture::{
-            Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCapturePicker,
-            GraphicsCaptureSession,
+            Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
+            GraphicsCapturePicker, GraphicsCaptureSession,
         },
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
+        SizeInt32,
     },
     Win32::{
         Foundation::{FALSE, HMODULE, HWND, LPARAM, POINT, RECT, TRUE},
@@ -30,7 +31,10 @@ use windows::{
                 D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
                 ID3D11Device, ID3D11Texture2D,
             },
-            Dxgi::IDXGIDevice,
+            Dxgi::{
+                DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+                IDXGIDevice,
+            },
             Gdi::{EnumDisplayMonitors, HDC, HMONITOR, MONITOR_DEFAULTTONULL, MonitorFromPoint},
         },
         Media::{
@@ -304,33 +308,12 @@ impl VideoConfig {
                         let gate = Mutex::new(FpsGate::new(fps));
                         let staging: Mutex<Option<(ID3D11Texture2D, u32, u32)>> = Mutex::new(None);
                         let pool_size = Mutex::new(item_size);
-                        let token = pool.FrameArrived(&TypedEventHandler::<
-                            Direct3D11CaptureFramePool,
-                            IInspectable,
-                        >::new(
-                            move |pool, _| {
-                                if terminate_c.load(Ordering::Relaxed) {
-                                    return Ok(());
-                                }
-                                let Some(pool) = pool.as_ref() else {
-                                    return Ok(());
-                                };
-                                let frame = pool.TryGetNextFrame()?;
-                                // The pool keeps handing out textures of the size it was made
-                                // with, clipping or padding a source that has since resized.
-                                let content = frame.ContentSize()?;
-                                let mut pool_size = pool_size.lock();
-                                if content.Width > 0 && content.Height > 0 && content != *pool_size
-                                {
-                                    pool.Recreate(
-                                        &winrt_device(&d3d_device)?,
-                                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                                        3,
-                                        content,
-                                    )?;
-                                    *pool_size = content;
-                                }
-                                drop(pool_size);
+                        let copy_device = d3d_device.clone();
+                        // Copy one frame out, cropped to `content`.
+                        let copy_frame =
+                            move |frame: &Direct3D11CaptureFrame,
+                                  content: SizeInt32|
+                                  -> windows::core::Result<()> {
                                 let ts = frame
                                     .SystemRelativeTime()
                                     .ok()
@@ -377,7 +360,7 @@ impl VideoConfig {
                                             ..desc
                                         };
                                         let mut cpu_texture = None;
-                                        d3d_device.CreateTexture2D(
+                                        copy_device.CreateTexture2D(
                                             &cpu_desc,
                                             None,
                                             Some(&mut cpu_texture),
@@ -435,10 +418,79 @@ impl VideoConfig {
                                     ts,
                                 });
                                 Ok(())
+                            };
+                        let on_frame =
+                            move |pool: &Direct3D11CaptureFramePool| -> windows::core::Result<()> {
+                                let frame = pool.TryGetNextFrame()?;
+                                // The pool keeps handing out textures of the size it was
+                                // made with, clipping or padding a source that has since
+                                // resized, so a change means recreating it -- but not
+                                // before this frame, which belongs to the generation being
+                                // replaced, has gone back to the pool. The copy's outcome
+                                // is carried past that, so a resize is followed up
+                                // whichever way the copy went, including the early return
+                                // on a full channel.
+                                let content = frame.ContentSize()?;
+                                let copied = copy_frame(&frame, content);
+                                let _ = frame.Close();
+                                drop(frame);
+                                let mut pool_size = pool_size.lock();
+                                if content.Width > 0 && content.Height > 0 && content != *pool_size
+                                {
+                                    pool.Recreate(
+                                        &winrt_device(&d3d_device)?,
+                                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                        3,
+                                        content,
+                                    )?;
+                                    *pool_size = content;
+                                }
+                                drop(pool_size);
+                                copied
+                            };
+                        let pump = GetCurrentThreadId();
+                        let token = pool.FrameArrived(&TypedEventHandler::<
+                            Direct3D11CaptureFramePool,
+                            IInspectable,
+                        >::new(
+                            move |pool, _| {
+                                if terminate_c.load(Ordering::Relaxed) {
+                                    return Ok(());
+                                }
+                                let Some(pool) = pool.as_ref() else {
+                                    return Ok(());
+                                };
+                                // Logged rather than handed back to WinRT, which discards it
+                                // silently: a persistent failure here -- a lost D3D11 device,
+                                // say -- otherwise just stops frames arriving, with nothing in
+                                // the log and the channel still open, so a consumer waits in
+                                // `recv` with no way to tell why.
+                                if let Err(e) = on_frame(pool) {
+                                    error!("capture frame failed: {e}");
+                                    // A device that was removed, reset or hung never comes back
+                                    // for this capture, so end it: every later frame would fail
+                                    // the same way, leaving a consumer in `recv` with no sign
+                                    // that the frames have stopped for good.
+                                    if [
+                                        DXGI_ERROR_DEVICE_REMOVED,
+                                        DXGI_ERROR_DEVICE_RESET,
+                                        DXGI_ERROR_DEVICE_HUNG,
+                                    ]
+                                    .contains(&e.code())
+                                    {
+                                        terminate_c.store(true, Ordering::Relaxed);
+                                        let _ = PostThreadMessageW(
+                                            pump,
+                                            WM_NULL,
+                                            Default::default(),
+                                            Default::default(),
+                                        );
+                                    }
+                                }
+                                Ok(())
                             },
                         ))?;
                         let terminate_closed = terminate.clone();
-                        let pump = GetCurrentThreadId();
                         item.Closed(
                             &TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(
                                 move |_, _| {
@@ -624,6 +676,11 @@ impl Loopback {
             CoTaskMemFree(Some(format as *const _));
             init?;
             let sample_fmt = sample_fmt.ok_or(Unsupported::SampleFormat)?;
+            // Both are divisors in the poll and timeline maths below, so a mix format that
+            // reports zero for either is one this backend cannot take, not a panic.
+            if sample_rate <= 0 || nb_channels <= 0 {
+                return Err(Unsupported::SampleFormat.into());
+            }
             let buffer_frames = audio_client.GetBufferSize()?;
             let mut device_period = 0i64;
             audio_client.GetDevicePeriod(Some(&mut device_period), None)?;

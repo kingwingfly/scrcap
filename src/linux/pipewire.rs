@@ -132,6 +132,23 @@ impl PipewireSession {
                         move |_| mainloop.quit()
                     });
 
+                    // Stopping the share from the desktop destroys the portal's node, which
+                    // only pauses this stream -- `Unconnected` never comes -- so the node's
+                    // removal is what ends the capture. Listener before registry: locals drop
+                    // in reverse order.
+                    let registry = core.get_registry_rc()?;
+                    let _node_listener = registry
+                        .add_listener_local()
+                        .global_remove({
+                            let mainloop = mainloop.clone();
+                            move |id| {
+                                if id == node_id {
+                                    mainloop.quit();
+                                }
+                            }
+                        })
+                        .register();
+
                     let video_stream = StreamRc::new(
                         core.clone(),
                         "scrcap-video",
@@ -185,19 +202,10 @@ impl PipewireSession {
                             Fraction { num: max_framerate, denom: 1 }
                         }
                     };
-                    let values: Vec<u8> = PodSerializer::serialize(
-                        std::io::Cursor::new(Vec::new()),
-                        &Value::Object(obj),
-                    )
-                    .map_err(|e| {
-                        error!("failed to serialize video format: {e}");
-                        CaptureError::SpaParams
-                    })?
-                    .0
-                    .into_inner();
+                    let values = serialize_pod(Value::Object(obj))?;
                     let meta = meta_header_param()?;
                     let mut params = [
-                        Pod::from_bytes(&values).ok_or_else(|| CaptureError::SpaParams)?,
+                        Pod::from_bytes(&values).ok_or(CaptureError::SpaParams)?,
                         Pod::from_bytes(&meta).ok_or(CaptureError::SpaParams)?,
                     ];
                     video_stream.connect(
@@ -211,8 +219,13 @@ impl PipewireSession {
 
                     let _audio = if let Some(a_tx) = a_tx {
                         // Desktop audio is not a screencast node, so it needs the ordinary
-                        // connection rather than the portal's remote.
-                        let audio_core = context.connect_rc(None)?;
+                        // connection rather than the portal's remote. A sandbox may grant only
+                        // the latter; that is audio being unavailable, not the capture failing,
+                        // so say which so the caller can retry without it.
+                        let audio_core = context.connect_rc(None).map_err(|e| {
+                            error!("no PipeWire connection for audio: {e}");
+                            Unsupported::Audio
+                        })?;
                         let audio_stream = StreamRc::new(
                             audio_core.clone(),
                             "scrcap-audio",
@@ -246,19 +259,10 @@ impl PipewireSession {
                                 FormatProperties::AudioFormat, Id, AudioFormat::F32P
                             },
                         };
-                        let values: Vec<u8> = PodSerializer::serialize(
-                            std::io::Cursor::new(Vec::new()),
-                            &Value::Object(obj),
-                        )
-                        .map_err(|e| {
-                            error!("failed to serialize audio format: {e}");
-                            CaptureError::SpaParams
-                        })?
-                        .0
-                        .into_inner();
+                        let values = serialize_pod(Value::Object(obj))?;
                         let meta = meta_header_param()?;
                         let mut params = [
-                            Pod::from_bytes(&values).ok_or_else(|| CaptureError::SpaParams)?,
+                            Pod::from_bytes(&values).ok_or(CaptureError::SpaParams)?,
                             Pod::from_bytes(&meta).ok_or(CaptureError::SpaParams)?,
                         ];
                         // No target: `node_id` is the portal's *video* node, and an audio
@@ -345,10 +349,15 @@ fn meta_header_param() -> Result<Vec<u8>> {
             },
         ],
     };
+    serialize_pod(Value::Object(obj))
+}
+
+/// Serialize a stream parameter into the bytes `Pod::from_bytes` reads back.
+fn serialize_pod(value: Value) -> Result<Vec<u8>> {
     Ok(
-        PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+        PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &value)
             .map_err(|e| {
-                error!("failed to serialize meta param: {e}");
+                error!("failed to serialize a stream parameter: {e}");
                 CaptureError::SpaParams
             })?
             .0
@@ -428,7 +437,8 @@ fn video_process_callback(stream: &Stream, data: &mut VideoData) {
                     stream.queue_raw_buffer(buffer);
                     return;
                 };
-                if !data.gate.allow(ts) {
+                // A full channel would drop the frame anyway; do not copy it first.
+                if data.tx.is_full() || !data.gate.allow(ts) {
                     stream.queue_raw_buffer(buffer);
                     return;
                 }

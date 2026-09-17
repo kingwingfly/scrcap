@@ -175,7 +175,7 @@ impl CaptureConfig {
                     }
                     Err(e) => {
                         let _ = setup_tx.send(Err(e));
-                        return Ok(());
+                        return;
                     }
                 };
 
@@ -206,7 +206,6 @@ impl CaptureConfig {
                     error!("failed to stop capture: {e}");
                 }
                 drop(stream_delegate);
-                Ok(())
             }
         });
 
@@ -285,6 +284,11 @@ unsafe fn exclude_from_picked(
     unsafe {
         if excluded.is_empty() || filter.style() != SCShareableContentStyle::Display {
             return Ok(filter);
+        }
+        // `includedDisplays` is macOS 15.2+, the picker only 14.0+: sending it to an older
+        // filter raises an uncaught unrecognized-selector exception.
+        if !filter.respondsToSelector(sel!(includedDisplays)) {
+            return Err(Unsupported::HideWindows.into());
         }
         let display = filter
             .includedDisplays()
@@ -410,7 +414,7 @@ pub struct CaptureDesc {
     a_rx: Option<Receiver<AudioFrame>>,
     video_desc: CaptureVideoDesc,
     audio_desc: Option<CaptureAudioDesc>,
-    jh: Option<JoinHandle<Result<()>>>,
+    jh: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug)]

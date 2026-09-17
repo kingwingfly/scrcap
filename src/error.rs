@@ -121,7 +121,9 @@ pub enum Unsupported {
     /// The system picker. macOS needs 14.0 or newer for `SCContentSharingPicker`.
     #[error("the system picker")]
     Picker,
-    /// Capturing audio. macOS needs 13.0 or newer for it.
+    /// Capturing audio. macOS needs 13.0 or newer for it. Linux needs a connection to the
+    /// PipeWire daemon itself, which a sandbox that grants only the portal's screencast
+    /// remote does not give. Retrying with `audio: None` captures the video alone.
     #[error("capturing audio")]
     Audio,
     /// The audio format the system negotiated is not one [`SampleFmt`] can name.

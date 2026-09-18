@@ -1,0 +1,117 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to stamp, e.g. 0.1.0-alpha.1 (empty: checks only)"
+        type: string
+        default: ""
+
+      publish:
+        description: "publish to crates.io"
+        type: boolean
+        default: false
+
+      release:
+        description: "create the GitHub release"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write # gh release create
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install system libraries
+        # The Linux backend binds D-Bus and PipeWire; libspa's bindgen wants libclang.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev libpipewire-0.3-dev libclang-dev
+
+      - name: install cargo components
+        run: |
+          rustup component add clippy rustfmt
+          rustup target add x86_64-pc-windows-msvc aarch64-apple-darwin
+
+      - name: stamp the version
+        # The version in Cargo.toml is a 0.0.0 placeholder and the tag is what names a
+        # release, so the two can never disagree and cutting one commits nothing.
+        env:
+          # Through the environment, so a dispatch input is never parsed as shell.
+          INPUT_VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          RELEASE: ${{ github.event_name == 'push' || inputs.release }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=${GITHUB_REF_NAME#v}
+          else
+            version=$INPUT_VERSION
+          fi
+
+          if [ -z "$version" ]; then
+            if [ "$PUBLISH" = true ] || [ "$RELEASE" = true ]; then
+              echo "publishing or releasing needs a version: push a tag, or fill in the version input" >&2
+              exit 1
+            fi
+            echo "no version given, so the checks run against the 0.0.0 placeholder"
+            exit 0
+          fi
+
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "'$version' is not a semver version" >&2
+            exit 1
+          fi
+
+          # The whole line, comment and all, and only the `[package]` one: every
+          # dependency spells its version inside an inline table, never at the start of a
+          # line. `cargo metadata` below is what actually confirms the edit landed.
+          sed -i "0,/^version = /{s|^version = .*|version = \"$version\"|}" Cargo.toml
+          stamped=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')
+          if [ "$stamped" != "$version" ]; then
+            echo "Cargo.toml says $stamped, not $version -- the placeholder moved" >&2
+            exit 1
+          fi
+
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "TAG=v$version" >> "$GITHUB_ENV"
+          echo "stamped $version"
+
+      - name: run checks
+        run: .github/scripts/publish_test.sh
+
+      # crates.io comes first because it cannot be undone, only yanked: a release naming a
+      # version that was never published is the easier of the two failures to recover from.
+      - name: publish to crates.io
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATESIO }}
+        # The stamped version is an uncommitted change on purpose, so the packaging step
+        # has to be told the working tree is meant to differ from the commit.
+        run: cargo publish --allow-dirty
+
+      - name: create the release
+        if: ${{ github.event_name == 'push' || inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=
+          case "$VERSION" in *-*) prerelease=--prerelease ;; esac
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            # The tag is what triggered this, so it already exists.
+            gh release create "$TAG" --verify-tag --generate-notes $prerelease
+          else
+            # Dispatched from a branch: tag the commit that was checked out.
+            gh release create "$TAG" --target "$GITHUB_SHA" --generate-notes $prerelease
+          fi

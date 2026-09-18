@@ -1,7 +1,12 @@
 [package]
 name = "scrcap"
-version = "0.1.0"
+version = "0.0.0" # a placeholder: .github/workflows/publish.yml stamps the tag
 edition = "2024"
+description = "Screen and system-audio capture for Windows, macOS and Linux"
+repository = "https://github.com/kingwingfly/scrcap"
+license = "MIT"
+keywords = ["screen-capture", "screencast", "screenshot", "audio"]
+categories = ["multimedia::video", "multimedia::audio", "os"]
 
 [dependencies]
 crossbeam-channel = "0.5.17"

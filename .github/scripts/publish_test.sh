@@ -22,6 +22,9 @@ statements=(
     # this one headless. It also runs the README doctests.
     "cargo test --features dummy"
     "cargo doc --no-deps"
+    # What docs.rs runs for its landing page. It cannot document the Linux backend:
+    # its build image has no libpipewire-0.3-dev for libspa-sys to find.
+    "cargo doc --lib --no-deps --target x86_64-pc-windows-msvc"
     # --allow-dirty: CI stamps the release version into Cargo.toml without committing
     # it, so the working tree is meant to differ from the commit being packaged.
     "cargo publish --dry-run --allow-dirty"

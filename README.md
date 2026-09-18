@@ -2,6 +2,10 @@
 
 A screen capture crate for Windows/macOS/Linux.
 
+The docs.rs pages cover the Windows and macOS backends only: the Linux one binds PipeWire,
+whose headers the docs.rs build image does not carry, so `cargo doc` locally is the only way
+to read `platform` for Linux.
+
 # Usage
 
 A capture is a [`CaptureConfig`] you `create()`, and a [`CaptureDescriptor`] you pull frames

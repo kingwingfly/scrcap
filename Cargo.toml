@@ -4,9 +4,16 @@ version = "0.0.0" # a placeholder: .github/workflows/publish.yml stamps the tag
 edition = "2024"
 description = "Screen and system-audio capture for Windows, macOS and Linux"
 repository = "https://github.com/kingwingfly/scrcap"
+documentation = "https://docs.rs/scrcap"
 license = "MIT"
 keywords = ["screen-capture", "screencast", "screenshot", "audio"]
 categories = ["multimedia::video", "multimedia::audio", "os"]
+
+[package.metadata.docs.rs]
+# `libspa-sys` needs the system PipeWire headers and the docs.rs build image has no
+# `libpipewire-0.3-dev`, so the Linux target cannot be documented there at all.
+default-target = "x86_64-pc-windows-msvc"
+targets = ["aarch64-apple-darwin"]
 
 [dependencies]
 crossbeam-channel = "0.5.17"

@@ -7,6 +7,23 @@ A screen capture crate for Windows/macOS/Linux.
 A capture is a [`CaptureConfig`] you `create()`, and a [`CaptureDescriptor`] you pull frames
 from. Video and audio get a channel each.
 
+## Seeing it work
+
+The quickest way to watch a capture is the `winit` example, a preview window that draws the
+captured frames into itself:
+
+```sh
+cargo run --example winit
+```
+
+It opens an always-on-top window, waits until that window has drawn a frame of its own, and
+only then raises the system picker. Pick a source and it appears in the window; `Esc` quits. 
+On Windows and macOS the preview **hides itself** from the capture through [`VideoConfig::hide`],
+on Linux no protocol allows that, so expect exactly that.
+
+For somewhere with no display and no picker, `cargo test --features dummy` swaps the whole
+platform module for a fake backend that generates frames, and runs the capture test headless.
+
 ## Video only
 
 `size()` is known by the time `create` returns; every frame carries its own size, pixel

@@ -9,7 +9,7 @@ use objc2::{
     AnyThread as _, DefinedClass as _, Message as _, define_class, msg_send, rc::Retained,
 };
 use objc2_core_audio_types::{
-    AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsFloat,
+    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsFloat,
     kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
     kAudioFormatLinearPCM,
 };
@@ -114,7 +114,9 @@ define_class!(
                         });
                     }
                     SCStreamOutputType::Audio => {
-                        let nb_samples = sample_buffer.num_samples() as i32;
+                        let Ok(nb_samples) = i32::try_from(sample_buffer.num_samples()) else {
+                            return;
+                        };
                         let Some(format_desc) = sample_buffer.format_description() else {
                             return;
                         };
@@ -128,24 +130,35 @@ define_class!(
                             return;
                         };
                         let rate = asbd.mSampleRate as i32;
-                        if rate <= 0 || asbd.mChannelsPerFrame == 0 {
+                        let Ok(nb_channels) = i32::try_from(asbd.mChannelsPerFrame) else {
+                            return;
+                        };
+                        if rate <= 0 || nb_channels <= 0 || nb_samples <= 0 {
                             return;
                         }
 
                         if let Some(sample_rate) = self.ivars().sample_rate.as_ref() {
                             sample_rate.store(rate, Ordering::Relaxed);
                         }
-                        let Some(aframe) = copy_audio_planes(sample_buffer) else {
+                        let Some(a_tx) = self.ivars().a_tx.as_ref() else {
                             return;
                         };
-                        let Some(a_tx) = self.ivars().a_tx.as_ref() else {
+                        if a_tx.is_full() {
+                            return;
+                        }
+                        let Some(aframe) = copy_audio_planes(
+                            sample_buffer,
+                            &asbd,
+                            sample_fmt,
+                            nb_samples as usize,
+                        ) else {
                             return;
                         };
                         let _ = a_tx.try_send(AudioFrame {
                             aframe,
                             nb_samples,
                             sample_rate: rate,
-                            nb_channels: asbd.mChannelsPerFrame as i32,
+                            nb_channels,
                             sample_fmt,
                             ts,
                         });
@@ -210,8 +223,28 @@ fn asbd_sample_fmt(asbd: &AudioStreamBasicDescription) -> Option<SampleFmt> {
 ///
 /// The plane pointers come from an `AudioBufferList`; the raw `CMBlockBuffer` is not
 /// documented to hold them in that layout.
-unsafe fn copy_audio_planes(sample_buffer: &CMSampleBuffer) -> Option<Vec<u8>> {
+unsafe fn copy_audio_planes(
+    sample_buffer: &CMSampleBuffer,
+    asbd: &AudioStreamBasicDescription,
+    format: SampleFmt,
+    samples: usize,
+) -> Option<Vec<u8>> {
     unsafe {
+        let (planes, channels_per_plane) = if format.is_planar() {
+            (asbd.mChannelsPerFrame as usize, 1)
+        } else {
+            (1, asbd.mChannelsPerFrame)
+        };
+        let frame_bytes = format
+            .bytes_per_sample()
+            .checked_mul(channels_per_plane as usize)?;
+        if frame_bytes != asbd.mBytesPerFrame as usize {
+            return None;
+        }
+        let plane_bytes = frame_bytes.checked_mul(samples)?;
+        let total = plane_bytes
+            .checked_mul(planes)
+            .filter(|&n| n <= isize::MAX as usize)?;
         let mut needed = 0usize;
         if sample_buffer.audio_buffer_list_with_retained_block_buffer(
             &mut needed,
@@ -242,20 +275,32 @@ unsafe fn copy_audio_planes(sample_buffer: &CMSampleBuffer) -> Option<Vec<u8>> {
         {
             return None;
         }
-        let block = Retained::from_raw(block);
-        let buffers =
-            core::slice::from_raw_parts((*list).mBuffers.as_ptr(), (*list).mNumberBuffers as usize);
-        let mut aframe = Vec::with_capacity(buffers.iter().map(|b| b.mDataByteSize as usize).sum());
+        let _block = Retained::from_raw(block)?;
+        let capacity = needed.checked_sub(core::mem::offset_of!(AudioBufferList, mBuffers))?
+            / size_of::<AudioBuffer>();
+        if (*list).mNumberBuffers as usize != planes || planes > capacity {
+            return None;
+        }
+        // mBuffers is the first element of a variable-length C array. Keep the pointer
+        // into the entire list allocation when accessing its subsequent elements.
+        let buffers = core::slice::from_raw_parts(
+            (&raw const (*list).mBuffers).cast::<AudioBuffer>(),
+            planes,
+        );
+        if buffers.iter().any(|buffer| {
+            buffer.mData.is_null()
+                || buffer.mNumberChannels != channels_per_plane
+                || (buffer.mDataByteSize as usize) < plane_bytes
+        }) {
+            return None;
+        }
+        let mut aframe = Vec::with_capacity(total);
         for buffer in buffers {
-            if buffer.mData.is_null() {
-                return None;
-            }
             aframe.extend_from_slice(core::slice::from_raw_parts(
                 buffer.mData as *const u8,
-                buffer.mDataByteSize as usize,
+                plane_bytes,
             ));
         }
-        drop(block);
         Some(aframe)
     }
 }
@@ -372,18 +417,22 @@ define_class!(
             &self,
             _picker: &SCContentSharingPicker,
             filter: &SCContentFilter,
-            _stream: Option<&SCStream>,
+            stream: Option<&SCStream>,
         ) {
-            let _ = self.ivars().tx.try_send(Ok(filter.retain()));
+            if stream.is_none() {
+                let _ = self.ivars().tx.try_send(Ok(filter.retain()));
+            }
         }
 
         #[unsafe(method(contentSharingPicker:didCancelForStream:))]
         unsafe fn contentSharingPicker_didCancelForStream(
             &self,
             _picker: &SCContentSharingPicker,
-            _stream: Option<&SCStream>,
+            stream: Option<&SCStream>,
         ) {
-            let _ = self.ivars().tx.try_send(Err(CaptureError::Cancelled));
+            if stream.is_none() {
+                let _ = self.ivars().tx.try_send(Err(CaptureError::Cancelled));
+            }
         }
 
         #[unsafe(method(contentSharingPickerStartDidFailWithError:))]

@@ -37,7 +37,9 @@ pub struct VideoConfig {
     /// The window id to hide from capture:
     /// - Windows: `HWND`
     /// - macOS: `CGWindowID`, which `platform::window_id_from_ns_view` derives from the
-    ///   `NSView` a window handle gives you.
+    ///   `NSView` a window handle gives you. With `Pick`, excluding windows from a
+    ///   display or application selection requires macOS 15.2 or newer. A selection
+    ///   whose exclusions cannot be applied returns [`Unsupported::HideWindows`].
     /// - Linux: unsupported, a non-empty list is [`Unsupported::HideWindows`]. Neither
     ///   Wayland nor X11 lets a client opt a window out of a screencast.
     ///

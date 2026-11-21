@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use windows::Win32::{
     Foundation::HWND,
     UI::WindowsAndMessaging::{
-        GetWindowDisplayAffinity, GetWindowThreadProcessId, IsWindow, SetWindowDisplayAffinity,
+        GetWindowDisplayAffinity, GetWindowThreadProcessId, SetWindowDisplayAffinity,
         WDA_EXCLUDEFROMCAPTURE, WINDOW_DISPLAY_AFFINITY,
     },
 };
@@ -99,7 +99,7 @@ pub(crate) fn unhide_window(token: HideToken) {
         // Undo only what is still ours: the window may be gone, its handle reused, or its
         // affinity changed by something else while the capture ran.
         let mut affinity = 0u32;
-        if IsWindow(Some(hwnd)).as_bool()
+        if GetWindowThreadProcessId(hwnd, None) == entry.thread
             && GetWindowDisplayAffinity(hwnd, &mut affinity).is_ok()
             && affinity == WDA_EXCLUDEFROMCAPTURE.0
         {

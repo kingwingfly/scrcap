@@ -61,8 +61,8 @@ use windows::{
         },
         UI::Shell::IInitializeWithWindow,
         UI::WindowsAndMessaging::{
-            DispatchMessageW, EnumWindows, GetMessageW, GetWindowTextW, IsWindowVisible, MSG,
-            PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WM_NULL, WM_USER,
+            DispatchMessageW, EnumWindows, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+            IsWindowVisible, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WM_NULL, WM_USER,
         },
     },
     core::{BOOL, HSTRING, IInspectable, Interface as _, factory},
@@ -124,7 +124,11 @@ unsafe extern "system" fn collect_monitor(
 unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
         if IsWindowVisible(hwnd).as_bool() {
-            let mut title = [0u16; 512];
+            let length = GetWindowTextLengthW(hwnd);
+            if length == 0 {
+                return TRUE;
+            }
+            let mut title = vec![0u16; length as usize + 1];
             let len = GetWindowTextW(hwnd, &mut title) as usize;
             if len > 0 {
                 let found = &mut *(lparam.0 as *mut (Regex, Option<HWND>));
@@ -314,6 +318,11 @@ impl VideoConfig {
                             move |frame: &Direct3D11CaptureFrame,
                                   content: SizeInt32|
                                   -> windows::core::Result<()> {
+                                // Only ContentSize pixels are defined, including on the
+                                // resize frame still backed by the old pool texture.
+                                if content.Width <= 0 || content.Height <= 0 {
+                                    return Ok(());
+                                }
                                 let ts = frame
                                     .SystemRelativeTime()
                                     .ok()
@@ -331,15 +340,9 @@ impl VideoConfig {
                                 // This frame was allocated at the pool's *old* size, and only
                                 // the top-left `ContentSize` of it is defined, so a source that
                                 // has shrunk is cropped rather than copied whole. Recreating
-                                // the pool above only fixes the frames after this one.
-                                let crop = |content: i32, texture: u32| {
-                                    u32::try_from(content)
-                                        .ok()
-                                        .filter(|side| *side > 0)
-                                        .map_or(texture, |side| side.min(texture))
-                                };
-                                let width = crop(content.Width, desc.Width);
-                                let height = crop(content.Height, desc.Height);
+                                // the pool only fixes the frames after this one.
+                                let width = desc.Width.min(content.Width as u32);
+                                let height = desc.Height.min(content.Height as u32);
 
                                 let mut staging = staging.lock();
                                 let cpu_texture = match staging.as_ref() {
@@ -750,6 +753,10 @@ impl Loopback {
                         Some(&mut qpc),
                     )?;
                 }
+                // WASAPI can report an empty packet without supplying a data pointer.
+                if nb_frames == 0 {
+                    break;
+                }
                 let packet_bytes = nb_frames as usize * self.frame_bytes;
                 let mut aframe = Vec::with_capacity(packet_bytes);
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
@@ -765,8 +772,9 @@ impl Loopback {
                 // second one early. `TIMESTAMP_ERROR` means the position is not usable, and
                 // a frame with no usable time of its own simply continues the timeline --
                 // which is the same QPC domain, not a foreign clock.
-                let ts = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc != 0)
-                    .then_some(qpc * 100);
+                let ts = qpc.checked_mul(100).filter(|&ts| {
+                    ts != 0 && flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0
+                });
                 self.emit(tx, terminate, &mut line, aframe, nb_frames, ts, false);
                 delivered = true;
             }

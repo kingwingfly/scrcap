@@ -11,12 +11,14 @@ use tracing::error;
 
 use parking_lot::Mutex;
 use pipewire::{
+    buffer::Buffer,
     channel::Sender as PwSender,
     context::ContextRc,
     keys,
     main_loop::MainLoopRc,
     properties::properties,
     spa::{
+        buffer::meta::MetaHeader,
         param::{
             ParamType,
             audio::{AudioFormat, AudioInfoRaw},
@@ -29,10 +31,9 @@ use pipewire::{
         },
         sys::{
             SPA_CHUNK_FLAG_CORRUPTED, SPA_META_Header, SPA_PARAM_META_size, SPA_PARAM_META_type,
-            SPA_PARAM_Meta, SPA_TYPE_OBJECT_ParamMeta, spa_buffer, spa_chunk, spa_data,
-            spa_meta_header,
+            SPA_PARAM_Meta, SPA_TYPE_OBJECT_ParamMeta, spa_data, spa_meta_header,
         },
-        utils::{Direction, Fraction, SpaTypes},
+        utils::{Direction, Fraction, Rectangle, SpaTypes},
     },
     stream::{Stream, StreamFlags, StreamRc, StreamState},
 };
@@ -43,7 +44,7 @@ use crate::{
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
-    util::pack_rows,
+    util::{pack_rows, row_span},
 };
 
 use super::dbus::{DbusScreen, SOURCE_TYPE_MONITOR};
@@ -54,9 +55,7 @@ struct VideoData {
     tx: Sender<VideoFrame>,
     mainloop: MainLoopRc,
     gate: FpsGate,
-    format: VideoInfoRaw,
-    /// What the negotiated `format` is called here; only meaningful once it is set.
-    pix_fmt: PixFmt,
+    format: Option<(Rectangle, PixFmt)>,
     size: Arc<Mutex<(u32, u32)>>,
     /// Answered from the format callback, so `new` only returns once the size is real, or
     /// from the state callback if the stream fails before that.
@@ -66,7 +65,7 @@ struct VideoData {
 struct AudioData {
     /// Dropped when the stream ends, which closes the channel a consumer is waiting on.
     tx: Option<Sender<AudioFrame>>,
-    format: AudioInfoRaw,
+    format: Option<AudioInfoRaw>,
     sample_rate: Arc<Mutex<Option<i32>>>,
 }
 
@@ -106,7 +105,6 @@ impl PipewireSession {
         };
 
         let fps = video.fps;
-        let max_framerate = fps.filter(|fps| *fps > 0).unwrap_or(1000);
         let size = Arc::new(Mutex::new((0, 0)));
         let sample_rate = audio.as_ref().map(|_audio| Arc::new(Mutex::new(None)));
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
@@ -159,8 +157,7 @@ impl PipewireSession {
                         tx: v_tx,
                         mainloop: mainloop.clone(),
                         gate: FpsGate::new(fps),
-                        format: VideoInfoRaw::new(),
-                        pix_fmt: PixFmt::Bgra,
+                        format: None,
                         size,
                         setup_tx: Some(setup_tx.clone()),
                     };
@@ -172,7 +169,7 @@ impl PipewireSession {
                         .state_changed(video_state_change_callback)
                         .register()?;
 
-                    let obj = object! {
+                    let mut obj = object! {
                         SpaTypes::ObjectParamFormat,
                         ParamType::EnumFormat,
                         property! {
@@ -189,29 +186,28 @@ impl PipewireSession {
                             VideoFormat::BGRA,
                             VideoFormat::BGRA,
                             VideoFormat::BGRx
-                        },
-                        property! {
+                        }
+                    };
+                    if let Some(max_framerate) = fps.filter(|fps| *fps > 0) {
+                        obj.properties.push(property! {
                             FormatProperties::VideoMaxFramerate,
                             Choice, Range, Fraction,
                             Fraction { num: max_framerate, denom: 1 },
                             Fraction { num: 0, denom: 1 },
                             Fraction { num: max_framerate, denom: 1 }
-                        }
-                    };
+                        });
+                    }
                     let values = serialize_pod(Value::Object(obj))?;
                     let meta = meta_header_param()?;
                     let mut params = [
                         Pod::from_bytes(&values).ok_or(CaptureError::SpaParams)?,
                         Pod::from_bytes(&meta).ok_or(CaptureError::SpaParams)?,
                     ];
-                    video_stream.connect(
-                        Direction::Input,
-                        Some(node_id),
-                        StreamFlags::AUTOCONNECT
-                            | StreamFlags::MAP_BUFFERS
-                            | StreamFlags::RT_PROCESS,
-                        &mut params,
-                    )?;
+                    // The local listeners share mutable format and channel state with their
+                    // process callbacks. Run all callbacks on this loop. Copying owned frames
+                    // also requires allocations that cannot run on PipeWire's realtime thread.
+                    let flags = StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS;
+                    video_stream.connect(Direction::Input, Some(node_id), flags, &mut params)?;
 
                     let _audio = if let Some(a_tx) = a_tx {
                         // Desktop audio is not a screencast node, so it needs the ordinary
@@ -234,7 +230,7 @@ impl PipewireSession {
                         )?;
                         let audio_data = AudioData {
                             tx: Some(a_tx),
-                            format: AudioInfoRaw::new(),
+                            format: None,
                             sample_rate: sample_rate.expect("sample_rate exists when audio is on"),
                         };
                         let audio_listener = audio_stream
@@ -266,14 +262,7 @@ impl PipewireSession {
                         // stream aimed at it can never link. `STREAM_CAPTURE_SINK` above is
                         // what tells the session manager to pick the default sink monitor,
                         // and an explicit target would override it.
-                        audio_stream.connect(
-                            Direction::Input,
-                            None,
-                            StreamFlags::AUTOCONNECT
-                                | StreamFlags::MAP_BUFFERS
-                                | StreamFlags::RT_PROCESS,
-                            &mut params,
-                        )?;
+                        audio_stream.connect(Direction::Input, None, flags, &mut params)?;
                         // Listener first: tuple fields drop in order, and a listener
                         // dropped after its stream unlinks its hook from freed memory.
                         Some((audio_listener, audio_stream))
@@ -365,19 +354,14 @@ fn serialize_pod(value: Value) -> Result<Vec<u8>> {
 ///
 /// Falls back to `CLOCK_MONOTONIC` -- the domain spa's `pts` is on -- if the producer
 /// attached no header despite [`meta_header_param`] asking for one.
-unsafe fn buffer_ts(buffer: *const spa_buffer) -> u64 {
+fn buffer_ts(buffer: &Buffer<'_>) -> u64 {
+    if let Some(header) = buffer.find_meta::<MetaHeader>()
+        && let Ok(pts) = u64::try_from(header.pts())
+        && pts != 0
+    {
+        return pts;
+    }
     unsafe {
-        let header = pipewire::spa::sys::spa_buffer_find_meta_data(
-            buffer as *mut _,
-            SPA_META_Header,
-            size_of::<spa_meta_header>(),
-        ) as *const spa_meta_header;
-        if !header.is_null()
-            && let Ok(pts) = u64::try_from((*header).pts)
-            && pts != 0
-        {
-            return pts;
-        }
         let mut now = core::mem::zeroed::<libc::timespec>();
         if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) != 0 {
             return 0;
@@ -386,12 +370,13 @@ unsafe fn buffer_ts(buffer: *const spa_buffer) -> u64 {
     }
 }
 
-/// Start of a chunk's valid data and how many bytes of it are actually readable.
+/// Start, contiguous length and stride of a plane in a dequeued buffer.
 ///
 /// SPA defines `offset` modulo `maxsize` and only guarantees `size` up to the end of the
 /// mapped allocation, so a producer may hand over an offset past it. Returns `None` for an
 /// unmapped, empty or corrupt chunk.
-unsafe fn chunk_slice(plane: spa_data, chunk: &spa_chunk) -> Option<(*const u8, usize)> {
+unsafe fn chunk_region(plane: &spa_data) -> Option<(*const u8, usize, i32)> {
+    let chunk = unsafe { plane.chunk.as_ref() }?;
     let maxsize = plane.maxsize as usize;
     if plane.data.is_null() || maxsize == 0 || chunk.size == 0 {
         return None;
@@ -401,57 +386,51 @@ unsafe fn chunk_slice(plane: spa_data, chunk: &spa_chunk) -> Option<(*const u8, 
     }
     let offset = chunk.offset as usize % maxsize;
     let avail = (maxsize - offset).min(chunk.size as usize);
-    Some((unsafe { (plane.data as *const u8).add(offset) }, avail))
+    Some((
+        unsafe { (plane.data as *const u8).add(offset) },
+        avail,
+        chunk.stride,
+    ))
 }
 
 fn video_process_callback(stream: &Stream, data: &mut VideoData) {
-    let buffer = unsafe { stream.dequeue_raw_buffer() };
-    if buffer.is_null() {
+    let Some(mut buffer) = stream.dequeue_buffer() else {
+        return;
+    };
+    let Some((size, pix_fmt)) = data.format else {
+        return;
+    };
+    if data.tx.is_full() {
         return;
     }
-    unsafe {
-        if !(*buffer).buffer.is_null() {
-            let spa_buffer = &*(*buffer).buffer;
-            let ts = buffer_ts(spa_buffer);
-            if spa_buffer.n_datas >= 1 {
-                let size = data.format.size();
-                let plane = spa_buffer.datas; // first elem
-                let chunk = &*(*plane).chunk;
-                let row_bytes = size.width as usize * 4;
-                let stride = if chunk.stride > 0 {
-                    chunk.stride as usize
-                } else {
-                    row_bytes
-                };
-                let height = size.height as usize;
-                let want = stride.saturating_mul(height);
-                // Validate before the gate: an unusable buffer must not spend the slot
-                // the next real frame needs.
-                let usable = chunk_slice(*plane, chunk)
-                    .filter(|&(_, avail)| want != 0 && avail >= want && stride >= row_bytes);
-                let Some((base, _)) = usable else {
-                    stream.queue_raw_buffer(buffer);
-                    return;
-                };
-                // A full channel would drop the frame anyway; do not copy it first.
-                if data.tx.is_full() || !data.gate.allow(ts) {
-                    stream.queue_raw_buffer(buffer);
-                    return;
-                }
-                let Some(vframe) = pack_rows(base, stride, row_bytes, height) else {
-                    stream.queue_raw_buffer(buffer);
-                    return;
-                };
-                let _ = data.tx.try_send(VideoFrame {
-                    vframe,
-                    size: (size.width, size.height),
-                    pix_fmt: data.pix_fmt,
-                    ts,
-                });
-            }
-        }
-        stream.queue_raw_buffer(buffer);
+    let ts = buffer_ts(&buffer);
+    let Some(plane) = buffer.datas_mut().first() else {
+        return;
+    };
+    let Some((base, avail, stride)) = (unsafe { chunk_region(plane.as_raw()) }) else {
+        return;
+    };
+    let Some(row_bytes) = (size.width as usize).checked_mul(pix_fmt.bytes_per_pixel()) else {
+        return;
+    };
+    let Ok(stride) = usize::try_from(stride) else {
+        return;
+    };
+    let pitch = if stride == 0 { row_bytes } else { stride };
+    let height = size.height as usize;
+    // An unusable buffer must not spend the next frame's slot.
+    if row_span(pitch, row_bytes, height).is_none_or(|span| span > avail) || !data.gate.allow(ts) {
+        return;
     }
+    let Some(vframe) = (unsafe { pack_rows(base, pitch, row_bytes, height) }) else {
+        return;
+    };
+    let _ = data.tx.try_send(VideoFrame {
+        vframe,
+        size: (size.width, size.height),
+        pix_fmt,
+        ts,
+    });
 }
 
 /// Leave the loop when the stream ends on its own, so the senders drop and a consumer's
@@ -482,27 +461,40 @@ fn video_param_change_callback(
     id: u32,
     param: Option<&Pod>,
 ) {
-    let Some(param) = param else {
-        return;
-    };
     if id != ParamType::Format.as_raw() {
         return;
     }
-    let Ok((MediaType::Video, MediaSubtype::Raw)) = parse_format(param) else {
+    data.format = param.and_then(video_format);
+    let Some((size, _)) = data.format else {
+        // A null parameter clears the old format during renegotiation.
+        if param.is_some() {
+            error!("PipeWire negotiated an unusable video format");
+            if let Some(tx) = data.setup_tx.take() {
+                let _ = tx.try_send(Err(CaptureError::StreamFailed));
+            }
+            data.mainloop.quit();
+        }
         return;
     };
-    if data.format.parse(param).is_err() {
-        return;
-    }
-    data.pix_fmt = match data.format.format() {
-        VideoFormat::BGRx => PixFmt::Bgr0,
-        _ => PixFmt::Bgra,
-    };
-    let size = data.format.size();
     *data.size.lock() = (size.width, size.height);
     if let Some(setup_tx) = data.setup_tx.take() {
         let _ = setup_tx.try_send(Ok(()));
     }
+}
+
+fn video_format(param: &Pod) -> Option<(Rectangle, PixFmt)> {
+    if parse_format(param).ok()? != (MediaType::Video, MediaSubtype::Raw) {
+        return None;
+    }
+    let mut format = VideoInfoRaw::new();
+    format.parse(param).ok()?;
+    let pix_fmt = match format.format() {
+        VideoFormat::BGRA => PixFmt::Bgra,
+        VideoFormat::BGRx => PixFmt::Bgr0,
+        _ => return None,
+    };
+    let size = format.size();
+    (size.width > 0 && size.height > 0).then_some((size, pix_fmt))
 }
 
 /// Close the audio channel when its stream ends, so a consumer's `recv` reports that the
@@ -522,65 +514,52 @@ fn audio_state_change_callback(
 }
 
 fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
-    let buffer = unsafe { stream.dequeue_raw_buffer() };
-    if buffer.is_null() {
-        return;
-    }
-    let Some(tx) = data.tx.as_ref() else {
-        unsafe { stream.queue_raw_buffer(buffer) };
+    let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
-    unsafe {
-        if !(*buffer).buffer.is_null() {
-            let spa_buffer = &*(*buffer).buffer;
-            if spa_buffer.n_datas >= 1 {
-                let sample_rate = data.format.rate();
-                let nb_channels = data.format.channels();
-                if sample_rate == 0 || nb_channels == 0 {
-                    stream.queue_raw_buffer(buffer);
-                    return;
-                }
-                // F32P is one plane per channel, so the frame carries exactly `nb_channels`
-                // of them: reading fewer would make `nb_channels` a lie about the payload
-                // and send a consumer that indexes plane `c` off the end of `aframe`.
-                let n_planes = nb_channels as usize;
-                if (spa_buffer.n_datas as usize) < n_planes {
-                    stream.queue_raw_buffer(buffer);
-                    return;
-                }
-                // All the planes are the same length, so the shortest readable one sets the
-                // frame's sample count rather than misaligning the planes after it.
-                let plane_bytes = (0..n_planes)
-                    .map(|i| {
-                        let plane = spa_buffer.datas.add(i);
-                        chunk_slice(*plane, &*(*plane).chunk).map_or(0, |(_, avail)| avail)
-                    })
-                    .min()
-                    .unwrap_or(0);
-                let nb_samples = plane_bytes / size_of::<f32>();
-                if nb_samples > 0 {
-                    let plane_bytes = nb_samples * size_of::<f32>();
-                    let mut aframe = Vec::with_capacity(plane_bytes * n_planes);
-                    for i in 0..n_planes {
-                        let plane = spa_buffer.datas.add(i);
-                        if let Some((base, _)) = chunk_slice(*plane, &*(*plane).chunk) {
-                            aframe
-                                .extend_from_slice(core::slice::from_raw_parts(base, plane_bytes));
-                        }
-                    }
-                    let _ = tx.try_send(AudioFrame {
-                        aframe,
-                        nb_samples: nb_samples as i32,
-                        sample_rate: sample_rate as i32,
-                        nb_channels: nb_channels as i32,
-                        sample_fmt: SampleFmt::F32P,
-                        ts: buffer_ts(spa_buffer),
-                    });
-                }
-            }
-        }
-        stream.queue_raw_buffer(buffer);
+    let (Some(tx), Some(format)) = (&data.tx, &data.format) else {
+        return;
+    };
+    if tx.is_full() {
+        return;
     }
+    let ts = buffer_ts(&buffer);
+    let channels = format.channels() as usize;
+    let Some(planes) = buffer.datas_mut().get(..channels) else {
+        return;
+    };
+    // F32P has one plane per channel. Truncate every plane at the same sample boundary.
+    let plane_bytes = planes
+        .iter()
+        .map(|plane| unsafe { chunk_region(plane.as_raw()) }.map_or(0, |(_, avail, _)| avail))
+        .min()
+        .unwrap_or(0);
+    let nb_samples = plane_bytes / size_of::<f32>();
+    if nb_samples == 0 {
+        return;
+    }
+    let plane_bytes = nb_samples * size_of::<f32>();
+    let Some(total) = plane_bytes
+        .checked_mul(channels)
+        .filter(|&n| n <= isize::MAX as usize)
+    else {
+        return;
+    };
+    let mut aframe = Vec::with_capacity(total);
+    for plane in planes {
+        let Some((base, _, _)) = (unsafe { chunk_region(plane.as_raw()) }) else {
+            return;
+        };
+        aframe.extend_from_slice(unsafe { core::slice::from_raw_parts(base, plane_bytes) });
+    }
+    let _ = tx.try_send(AudioFrame {
+        aframe,
+        nb_samples: nb_samples as i32,
+        sample_rate: format.rate() as i32,
+        nb_channels: format.channels() as i32,
+        sample_fmt: SampleFmt::F32P,
+        ts,
+    });
 }
 
 fn audio_param_change_callback(
@@ -589,21 +568,24 @@ fn audio_param_change_callback(
     id: u32,
     param: Option<&Pod>,
 ) {
-    let Some(param) = param else {
-        return;
-    };
     if id != ParamType::Format.as_raw() {
         return;
     }
-    let Ok((MediaType::Audio, MediaSubtype::Raw)) = parse_format(param) else {
-        return;
-    };
-    if data.format.parse(param).is_err() {
-        return;
-    }
-    let rate = data.format.rate() as i32;
-    if rate > 0 {
-        *data.sample_rate.lock() = Some(rate);
+    data.format = param.and_then(|param| {
+        if parse_format(param).ok()? != (MediaType::Audio, MediaSubtype::Raw) {
+            return None;
+        }
+        let mut format = AudioInfoRaw::new();
+        format.parse(param).ok()?;
+        (format.format() == AudioFormat::F32P
+            && format.rate() as i32 > 0
+            && format.channels() as i32 > 0)
+            .then_some(format)
+    });
+    *data.sample_rate.lock() = data.format.as_ref().map(|format| format.rate() as i32);
+    if param.is_some() && data.format.is_none() {
+        error!("PipeWire negotiated an unusable audio format");
+        data.tx.take();
     }
 }
 
@@ -612,6 +594,38 @@ impl Drop for PipewireSession {
         self.terminate();
         if let Some(jh) = self.jh.take() {
             let _ = jh.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negotiated_video_requires_a_supported_format_and_nonempty_size() {
+        let size = Rectangle {
+            width: 16,
+            height: 8,
+        };
+        for (format, dimensions, expected) in [
+            (VideoFormat::BGRA, size, Some(PixFmt::Bgra)),
+            (VideoFormat::BGRx, size, Some(PixFmt::Bgr0)),
+            (VideoFormat::RGB, size, None),
+            (VideoFormat::BGRA, Rectangle { width: 0, ..size }, None),
+        ] {
+            let obj = object! {
+                SpaTypes::ObjectParamFormat, ParamType::Format,
+                property! { FormatProperties::MediaType, Id, MediaType::Video },
+                property! { FormatProperties::MediaSubtype, Id, MediaSubtype::Raw },
+                property! { FormatProperties::VideoFormat, Id, format },
+                property! { FormatProperties::VideoSize, Rectangle, dimensions }
+            };
+            let bytes = serialize_pod(Value::Object(obj)).unwrap();
+            assert_eq!(
+                video_format(Pod::from_bytes(&bytes).unwrap()),
+                expected.map(|pix_fmt| (dimensions, pix_fmt))
+            );
         }
     }
 }

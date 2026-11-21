@@ -26,13 +26,14 @@ use objc2::{
     runtime::{AnyClass, ProtocolObject},
     sel,
 };
-use objc2_core_media::{CMTime, CMTimeFlags};
+use objc2_core_media::{CMTime, kCMTimeZero};
 use objc2_foundation::{NSArray, NSError, NSNumber, NSObjectProtocol as _};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCContentSharingPicker, SCContentSharingPickerConfiguration, SCDisplay,
     SCShareableContent, SCShareableContentStyle, SCStream, SCStreamConfiguration,
     SCStreamOutputType, SCWindow,
 };
+use parking_lot::Mutex;
 use regex::Regex;
 use tracing::error;
 
@@ -106,14 +107,11 @@ impl CaptureConfig {
                         stream_config.setCaptureMicrophone(false);
                     }
                     stream_config.setPixelFormat(u32::from_be_bytes(*b"BGRA"));
-                    if let Some(fps) = self.video.fps.filter(|fps| *fps > 0) {
-                        stream_config.setMinimumFrameInterval(CMTime {
-                            value: 1,
-                            timescale: fps as i32,
-                            flags: CMTimeFlags::Valid,
-                            epoch: 0,
-                        });
-                    }
+                    let interval = match self.video.fps {
+                        None | Some(0) => kCMTimeZero,
+                        Some(fps) => CMTime::new(1, i32::try_from(fps).unwrap_or(i32::MAX)),
+                    };
+                    stream_config.setMinimumFrameInterval(interval);
 
                     let stream_delegate = StreamDelegate::new(
                         parker.unparker().clone(),
@@ -245,22 +243,27 @@ unsafe fn shareable_content() -> Result<Retained<SCShareableContent>> {
             });
         });
         SCShareableContent::getShareableContentWithCompletionHandler(&block);
+        drop(block);
         rx.recv().map_err(|_| CaptureError::WorkerGone)?
     }
 }
 
 unsafe fn present_picker(excluded: &[u32]) -> Result<(Retained<SCContentFilter>, usize, usize)> {
+    // New-stream selections have no stream ID. Only one of our observers can own one.
+    static PRESENTING: Mutex<()> = Mutex::new(());
     unsafe {
         if AnyClass::get(c"SCContentSharingPicker").is_none() {
             return Err(Unsupported::Picker.into());
         }
         let (tx, rx) = bounded(1);
         let observer = PickerObserver::new(tx);
+        let presenting = PRESENTING.lock();
         let picker = SCContentSharingPicker::sharedPicker();
         // The picker is a process-wide singleton, so this configuration outlives the call
         // and would silently narrow the next one. Always install ours, always put back
         // what was there.
         let previous = picker.defaultConfiguration();
+        let was_active = picker.isActive();
         let config = SCContentSharingPickerConfiguration::new();
         let ids: Vec<_> = excluded.iter().copied().map(NSNumber::new_u32).collect();
         config.setExcludedWindowIDs(&NSArray::from_retained_slice(&ids));
@@ -269,9 +272,10 @@ unsafe fn present_picker(excluded: &[u32]) -> Result<(Retained<SCContentFilter>,
         picker.setActive(true);
         picker.present();
         let filter = rx.recv().map_err(|_| CaptureError::WorkerGone);
-        picker.setActive(false);
         picker.removeObserver(ProtocolObject::from_ref(&*observer));
         picker.setDefaultConfiguration(&previous);
+        picker.setActive(was_active);
+        drop(presenting);
 
         let filter = exclude_from_picked(filter??, excluded)?;
         let (width, height) = filter_size(&filter).ok_or(Unsupported::Picker)?;
@@ -282,14 +286,13 @@ unsafe fn present_picker(excluded: &[u32]) -> Result<(Retained<SCContentFilter>,
 /// Carry `hide` into the filter the picker handed back.
 ///
 /// `excludedWindowIDs` only keeps a window out of the *picker*; the filter it returns for a
-/// display still contains it. A display filter is therefore rebuilt with the exclusions,
-/// and a window or application filter needs none -- it captures what the user named.
+/// display or application can still contain it. Rebuild those filters with exclusions.
 unsafe fn exclude_from_picked(
     filter: Retained<SCContentFilter>,
     excluded: &[u32],
 ) -> Result<Retained<SCContentFilter>> {
     unsafe {
-        if excluded.is_empty() || filter.style() != SCShareableContentStyle::Display {
+        if excluded.is_empty() || filter.style() == SCShareableContentStyle::Window {
             return Ok(filter);
         }
         // `includedDisplays` is macOS 15.2+, the picker only 14.0+: sending it to an older
@@ -297,16 +300,50 @@ unsafe fn exclude_from_picked(
         if !filter.respondsToSelector(sel!(includedDisplays)) {
             return Err(Unsupported::HideWindows.into());
         }
-        let display = filter
-            .includedDisplays()
-            .firstObject()
-            .ok_or(Unsupported::HideWindows)?;
         let content = shareable_content()?;
-        Ok(SCContentFilter::initWithDisplay_excludingWindows(
-            SCContentFilter::alloc(),
-            &display,
-            &NSArray::from_retained_slice(&windows_by_id(&content, excluded)),
-        ))
+        let hidden = windows_by_id(&content, excluded);
+        if hidden.is_empty() {
+            return Ok(filter);
+        }
+        let displays = filter.includedDisplays();
+        match filter.style() {
+            SCShareableContentStyle::Display if displays.len() == 1 => {
+                Ok(SCContentFilter::initWithDisplay_excludingWindows(
+                    SCContentFilter::alloc(),
+                    &displays.objectAtIndex(0),
+                    &NSArray::from_retained_slice(&hidden),
+                ))
+            }
+            SCShareableContentStyle::Application => {
+                let apps = filter.includedApplications();
+                if apps.is_empty() {
+                    return Err(Unsupported::HideWindows.into());
+                }
+                // An exception owned by an unselected app would add that window to the share.
+                let mut exceptions = Vec::new();
+                for window in hidden {
+                    let owner = window.owningApplication().ok_or(Unsupported::HideWindows)?;
+                    if apps.iter().any(|app| app.processID() == owner.processID()) {
+                        exceptions.push(window);
+                    }
+                }
+                if exceptions.is_empty() {
+                    return Ok(filter);
+                }
+                if displays.len() != 1 {
+                    return Err(Unsupported::HideWindows.into());
+                }
+                Ok(
+                    SCContentFilter::initWithDisplay_includingApplications_exceptingWindows(
+                        SCContentFilter::alloc(),
+                        &displays.objectAtIndex(0),
+                        &apps,
+                        &NSArray::from_retained_slice(&exceptions),
+                    ),
+                )
+            }
+            _ => Err(Unsupported::HideWindows.into()),
+        }
     }
 }
 
@@ -392,6 +429,7 @@ unsafe fn content_filter(
                 .map(|display| from_display(&display)),
             Target::Window(id) => u32::try_from(*id)
                 .ok()
+                .filter(|id| !excluded.contains(id))
                 .and_then(|id| shareable.windows().iter().find(|w| w.windowID() == id))
                 .map(|window| from_window(&window)),
             Target::WindowName(_) => re.and_then(|re| {
@@ -399,7 +437,9 @@ unsafe fn content_filter(
                     .windows()
                     .iter()
                     .find(|w| {
-                        w.isOnScreen() && w.title().is_some_and(|t| re.is_match(&t.to_string()))
+                        !excluded.contains(&w.windowID())
+                            && w.isOnScreen()
+                            && w.title().is_some_and(|t| re.is_match(&t.to_string()))
                     })
                     .map(|window| from_window(&window))
             }),

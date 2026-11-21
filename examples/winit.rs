@@ -5,7 +5,10 @@ use std::{sync::Arc, thread, time::Duration};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, TryRecvError, bounded};
 use log::{error, info, warn};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(
+    all(target_os = "macos", not(feature = "dummy")),
+    target_os = "windows"
+))]
 use wgpu::rwh::HasWindowHandle;
 use wgpu::{CurrentSurfaceTexture, util::DeviceExt as _};
 use winit::{
@@ -80,7 +83,7 @@ struct App {
 #[allow(unused_variables, unused_mut)]
 fn hide_self(window: &Window) -> Vec<isize> {
     let mut hide = Vec::new();
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "dummy")))]
     if let Ok(wgpu::rwh::RawWindowHandle::AppKit(handle)) =
         window.window_handle().map(|handle| handle.as_raw())
     {
@@ -180,6 +183,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 if !state.render() {
                     event_loop.exit();
+                    return;
                 }
                 // Only once the window has shown a frame: GNOME's mutter has crashed capturing
                 // a window, picked through the portal, that had not drawn yet.
@@ -206,6 +210,7 @@ impl ApplicationHandler for App {
 #[derive(Debug)]
 struct State {
     window: Arc<Window>,
+    instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -366,6 +371,7 @@ impl State {
 
         Ok(Self {
             window,
+            instance,
             surface,
             device,
             queue,
@@ -407,22 +413,21 @@ impl State {
 
     fn resize(&mut self, width: u32, height: u32) {
         info!("Resizing to {width}x{height}");
-        if width > 0 && height > 0 {
+        self.is_surface_configured = width > 0 && height > 0;
+        if self.is_surface_configured {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
-            self.is_surface_configured = true;
+            self.window.request_redraw();
         }
     }
 
     /// Returns false once the capture has ended, so the caller can leave the event loop.
     fn render(&mut self) -> bool {
-        self.window.request_redraw();
-
-        // We can't render unless the surface is configured
         if !self.is_surface_configured {
             return true;
         }
+        self.window.request_redraw();
 
         // `get_current_texture` no longer returns a `Result`; every outcome, including
         // the ones that used to be a `SurfaceError`, is a `CurrentSurfaceTexture` variant.
@@ -432,15 +437,26 @@ impl State {
             CurrentSurfaceTexture::Suboptimal(output) => (output, true),
             // Nothing to draw into right now; try again on the next redraw.
             CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return true,
-            CurrentSurfaceTexture::Outdated | CurrentSurfaceTexture::Lost => {
-                warn!("Surface lost or outdated, reconfiguring...");
+            CurrentSurfaceTexture::Lost => {
+                self.surface = match self.instance.create_surface(self.window.clone()) {
+                    Ok(surface) => surface,
+                    Err(e) => {
+                        error!("Unable to recreate the preview surface: {e}");
+                        return false;
+                    }
+                };
+                let size = self.window.inner_size();
+                self.resize(size.width, size.height);
+                return true;
+            }
+            CurrentSurfaceTexture::Outdated => {
                 let size = self.window.inner_size();
                 self.resize(size.width, size.height);
                 return true;
             }
             CurrentSurfaceTexture::Validation => {
                 error!("Unable to render: surface validation error");
-                return true;
+                return false;
             }
         };
         if !self.update() {

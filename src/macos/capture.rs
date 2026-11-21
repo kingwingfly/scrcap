@@ -21,7 +21,7 @@ use crossbeam_channel::{Receiver, bounded};
 use crossbeam_utils::sync::{Parker, Unparker};
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::{
-    AnyThread as _,
+    AnyThread as _, msg_send,
     rc::Retained,
     runtime::{AnyClass, ProtocolObject},
     sel,
@@ -259,27 +259,50 @@ unsafe fn present_picker(excluded: &[u32]) -> Result<(Retained<SCContentFilter>,
         let observer = PickerObserver::new(tx);
         let presenting = PRESENTING.lock();
         let picker = SCContentSharingPicker::sharedPicker();
-        // The picker is a process-wide singleton, so this configuration outlives the call
-        // and would silently narrow the next one. Always install ours, always put back
-        // what was there.
-        let previous = picker.defaultConfiguration();
+        // The host may already restrict this shared picker. Layer our exclusions onto its
+        // configuration only while we present it.
+        let previous = if excluded.is_empty() {
+            None
+        } else {
+            let previous = picker.defaultConfiguration();
+            picker.setDefaultConfiguration(&with_excluded_windows(&previous, excluded));
+            Some(previous)
+        };
         let was_active = picker.isActive();
-        let config = SCContentSharingPickerConfiguration::new();
-        let ids: Vec<_> = excluded.iter().copied().map(NSNumber::new_u32).collect();
-        config.setExcludedWindowIDs(&NSArray::from_retained_slice(&ids));
-        picker.setDefaultConfiguration(&config);
         picker.addObserver(ProtocolObject::from_ref(&*observer));
-        picker.setActive(true);
+        if !was_active {
+            picker.setActive(true);
+        }
         picker.present();
         let filter = rx.recv().map_err(|_| CaptureError::WorkerGone);
         picker.removeObserver(ProtocolObject::from_ref(&*observer));
-        picker.setDefaultConfiguration(&previous);
-        picker.setActive(was_active);
+        if let Some(previous) = previous {
+            picker.setDefaultConfiguration(&previous);
+        }
+        if !was_active {
+            picker.setActive(false);
+        }
         drop(presenting);
 
         let filter = exclude_from_picked(filter??, excluded)?;
         let (width, height) = filter_size(&filter).ok_or(Unsupported::Picker)?;
         Ok((filter, width, height))
+    }
+}
+
+unsafe fn with_excluded_windows(
+    previous: &SCContentSharingPickerConfiguration,
+    excluded: &[u32],
+) -> Retained<SCContentSharingPickerConfiguration> {
+    unsafe {
+        // ScreenCaptureKit copies this configuration when setting it on the picker.
+        let config: Retained<SCContentSharingPickerConfiguration> = msg_send![previous, copy];
+        let ids: Vec<_> = excluded.iter().copied().map(NSNumber::new_u32).collect();
+        let combined = previous
+            .excludedWindowIDs()
+            .arrayByAddingObjectsFromArray(&NSArray::from_retained_slice(&ids));
+        config.setExcludedWindowIDs(&combined);
+        config
     }
 }
 
@@ -528,6 +551,42 @@ impl Drop for CaptureDesc {
         let _ = self.a_rx.take();
         if let Some(jh) = self.jh.take() {
             let _ = jh.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_foundation::NSString;
+    use objc2_screen_capture_kit::SCContentSharingPickerMode;
+
+    #[test]
+    fn adding_exclusions_preserves_the_host_picker_configuration() {
+        if AnyClass::get(c"SCContentSharingPickerConfiguration").is_none() {
+            return;
+        }
+        unsafe {
+            let host = SCContentSharingPickerConfiguration::new();
+            host.setAllowedPickerModes(SCContentSharingPickerMode::SingleWindow);
+            host.setAllowsChangingSelectedContent(false);
+            host.setExcludedBundleIDs(&NSArray::from_retained_slice(&[NSString::from_str(
+                "org.example.Private",
+            )]));
+            host.setExcludedWindowIDs(&NSArray::from_retained_slice(&[NSNumber::new_u32(11)]));
+
+            let merged = with_excluded_windows(&host, &[22]);
+            assert_eq!(merged.allowedPickerModes(), host.allowedPickerModes());
+            assert!(!merged.allowsChangingSelectedContent());
+            assert_eq!(merged.excludedBundleIDs(), host.excludedBundleIDs());
+            let ids = |c: &SCContentSharingPickerConfiguration| {
+                c.excludedWindowIDs()
+                    .iter()
+                    .map(|number| number.as_u32())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ids(&merged), [11, 22]);
+            assert_eq!(ids(&host), [11]);
         }
     }
 }

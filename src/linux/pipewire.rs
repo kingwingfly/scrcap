@@ -1,7 +1,9 @@
 //! pipewire related
 
 use std::{
+    cell::Cell,
     fmt,
+    rc::Rc,
     sync::Arc,
     thread::{self, JoinHandle},
 };
@@ -14,9 +16,11 @@ use pipewire::{
     buffer::Buffer,
     channel::Sender as PwSender,
     context::ContextRc,
+    core::{self as pw_core, PW_ID_CORE},
     keys,
     main_loop::MainLoopRc,
     properties::properties,
+    registry,
     spa::{
         buffer::meta::MetaHeader,
         param::{
@@ -36,6 +40,7 @@ use pipewire::{
         utils::{Direction, Fraction, Rectangle, SpaTypes},
     },
     stream::{Stream, StreamFlags, StreamRc, StreamState},
+    types::ObjectType,
 };
 
 use crate::{
@@ -44,10 +49,10 @@ use crate::{
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
-    util::{pack_rows, row_span},
+    util::{append_rows, pack_rows, row_span},
 };
 
-use super::dbus::{DbusScreen, SOURCE_TYPE_MONITOR};
+use super::dbus::{DbusScreen, SOURCE_TYPE_MONITOR, StreamTarget};
 
 struct Terminate;
 
@@ -117,8 +122,6 @@ impl PipewireSession {
                 let run = || -> Result<()> {
                     let dbus = DbusScreen::new()?;
                     let session = dbus.start(source_types)?;
-                    let node_id = session.node_id;
-
                     let mainloop = MainLoopRc::new(None)?;
                     let context = ContextRc::new(&mainloop, None)?;
                     // The screencast node is only reachable on the remote the portal
@@ -131,27 +134,22 @@ impl PipewireSession {
                     });
 
                     let registry = core.get_registry_rc()?;
-                    let _node_listener = registry
-                        .add_listener_local()
-                        .global_remove({
-                            let mainloop = mainloop.clone();
-                            move |id| {
-                                if id == node_id {
-                                    mainloop.quit();
-                                }
-                            }
-                        })
-                        .register();
-
-                    let video_stream = StreamRc::new(
-                        core.clone(),
-                        "scrcap-video",
-                        properties! {
-                            *keys::MEDIA_TYPE => "Video",
-                            *keys::MEDIA_CATEGORY => "Capture",
-                            *keys::MEDIA_ROLE => "Screen",
-                        },
-                    )?;
+                    let _listeners = watch_target(&core, &registry, &mainloop, session.target)?;
+                    let mut props = properties! {
+                        *keys::MEDIA_TYPE => "Video",
+                        *keys::MEDIA_CATEGORY => "Capture",
+                        *keys::MEDIA_ROLE => "Screen",
+                        "node.dont-fallback" => "true",
+                        "node.dont-move" => "true",
+                    };
+                    let node_id = match session.target {
+                        StreamTarget::NodeId(id) => Some(id),
+                        StreamTarget::Serial(serial) => {
+                            props.insert("target.object", serial.to_string());
+                            None
+                        }
+                    };
+                    let video_stream = StreamRc::new(core.clone(), "scrcap-video", props)?;
 
                     let video_data = VideoData {
                         tx: v_tx,
@@ -207,7 +205,12 @@ impl PipewireSession {
                     // process callbacks. Run all callbacks on this loop. Copying owned frames
                     // also requires allocations that cannot run on PipeWire's realtime thread.
                     let flags = StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS;
-                    video_stream.connect(Direction::Input, Some(node_id), flags, &mut params)?;
+                    video_stream.connect(
+                        Direction::Input,
+                        node_id,
+                        flags | StreamFlags::DONT_RECONNECT,
+                        &mut params,
+                    )?;
 
                     let _audio = if let Some(a_tx) = a_tx {
                         // Desktop audio is not a screencast node, so it needs the ordinary
@@ -235,7 +238,11 @@ impl PipewireSession {
                         };
                         let audio_listener = audio_stream
                             .add_local_listener_with_user_data(audio_data)
-                            .param_changed(audio_param_change_callback)
+                            .param_changed(|_, data, id, param| {
+                                if id == ParamType::Format.as_raw() {
+                                    data.set_format(param);
+                                }
+                            })
                             .process(audio_process_callback)
                             .state_changed(audio_state_change_callback)
                             .register()?;
@@ -271,6 +278,8 @@ impl PipewireSession {
                     };
 
                     mainloop.run();
+                    // The target or remote can disappear before the first format arrives.
+                    let _ = setup_tx.try_send(Err(CaptureError::StreamFailed));
                     Ok(())
                 };
 
@@ -312,6 +321,87 @@ impl PipewireSession {
 
     pub fn terminate(&self) {
         let _ = self.quit_tx.send(Terminate);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetState {
+    Waiting(StreamTarget),
+    Present(u32),
+    Gone,
+}
+
+impl TargetState {
+    fn observe(self, id: u32, serial: Option<&str>) -> Self {
+        match self {
+            Self::Waiting(StreamTarget::NodeId(wanted)) if id == wanted => Self::Present(id),
+            Self::Waiting(StreamTarget::Serial(wanted))
+                if serial.and_then(|s| s.parse::<u64>().ok()) == Some(wanted) =>
+            {
+                Self::Present(id)
+            }
+            _ => self,
+        }
+    }
+}
+
+/// Enumerate the portal remote before connecting, then stop capture if the selected node goes away.
+fn watch_target(
+    core: &pw_core::Core,
+    registry: &registry::Registry,
+    mainloop: &MainLoopRc,
+    target: StreamTarget,
+) -> Result<(registry::Listener, pw_core::Listener)> {
+    let node = Rc::new(Cell::new(TargetState::Waiting(target)));
+    let globals = registry
+        .add_listener_local()
+        .global({
+            let node = node.clone();
+            move |global| {
+                if global.type_ == ObjectType::Node {
+                    let serial = global.props.and_then(|p| p.get("object.serial"));
+                    node.set(node.get().observe(global.id, serial));
+                }
+            }
+        })
+        .global_remove({
+            let node = node.clone();
+            let mainloop = mainloop.clone();
+            move |id| {
+                if node.get() == TargetState::Present(id) {
+                    node.set(TargetState::Gone);
+                    mainloop.quit();
+                }
+            }
+        })
+        .register();
+    let enumeration = core.sync(0)?;
+    let connection = core
+        .add_listener_local()
+        .done({
+            let mainloop = mainloop.clone();
+            move |id, seq| {
+                if id == PW_ID_CORE && seq == enumeration {
+                    mainloop.quit();
+                }
+            }
+        })
+        .error({
+            let node = node.clone();
+            let mainloop = mainloop.clone();
+            move |id, _, _, message| {
+                if id == PW_ID_CORE {
+                    error!("PipeWire remote error: {message}");
+                    node.set(TargetState::Gone);
+                    mainloop.quit();
+                }
+            }
+        })
+        .register();
+    mainloop.run();
+    match node.get() {
+        TargetState::Present(_) => Ok((globals, connection)),
+        _ => Err(CaptureError::StreamFailed),
     }
 }
 
@@ -528,33 +618,14 @@ fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
     let Some(planes) = buffer.datas_mut().get(..channels) else {
         return;
     };
-    // F32P has one plane per channel. Truncate every plane at the same sample boundary.
-    let plane_bytes = planes
-        .iter()
-        .map(|plane| unsafe { chunk_region(plane.as_raw()) }.map_or(0, |(_, avail, _)| avail))
-        .min()
-        .unwrap_or(0);
-    let nb_samples = plane_bytes / size_of::<f32>();
-    if nb_samples == 0 {
-        return;
-    }
-    let plane_bytes = nb_samples * size_of::<f32>();
-    let Some(total) = plane_bytes
-        .checked_mul(channels)
-        .filter(|&n| n <= isize::MAX as usize)
+    let Some((aframe, nb_samples)) =
+        (unsafe { pack_audio_planes(planes.iter().map(|p| p.as_raw())) })
     else {
         return;
     };
-    let mut aframe = Vec::with_capacity(total);
-    for plane in planes {
-        let Some((base, _, _)) = (unsafe { chunk_region(plane.as_raw()) }) else {
-            return;
-        };
-        aframe.extend_from_slice(unsafe { core::slice::from_raw_parts(base, plane_bytes) });
-    }
     let _ = tx.try_send(AudioFrame {
         aframe,
-        nb_samples: nb_samples as i32,
+        nb_samples,
         sample_rate: format.rate() as i32,
         nb_channels: format.channels() as i32,
         sample_fmt: SampleFmt::F32P,
@@ -562,30 +633,63 @@ fn audio_process_callback(stream: &Stream, data: &mut AudioData) {
     });
 }
 
-fn audio_param_change_callback(
-    _stream: &Stream,
-    data: &mut AudioData,
-    id: u32,
-    param: Option<&Pod>,
-) {
-    if id != ParamType::Format.as_raw() {
-        return;
-    }
-    data.format = param.and_then(|param| {
-        if parse_format(param).ok()? != (MediaType::Audio, MediaSubtype::Raw) {
+/// Copy planar F32 samples up to the last complete sample shared by all channels.
+/// Each plane and its chunk must remain mapped and readable throughout the copy.
+unsafe fn pack_audio_planes<'a>(
+    planes: impl ExactSizeIterator<Item = &'a spa_data> + Clone,
+) -> Option<(Vec<u8>, i32)> {
+    const SAMPLE_BYTES: usize = size_of::<f32>();
+    let channels = planes.len();
+    let layout = planes.map(|plane| {
+        let (base, avail, stride) = unsafe { chunk_region(plane) }?;
+        let pitch = if stride == 0 {
+            SAMPLE_BYTES
+        } else {
+            usize::try_from(stride).ok()?
+        };
+        if pitch < SAMPLE_BYTES {
             return None;
         }
-        let mut format = AudioInfoRaw::new();
-        format.parse(param).ok()?;
-        (format.format() == AudioFormat::F32P
-            && format.rate() as i32 > 0
-            && format.channels() as i32 > 0)
-            .then_some(format)
+        let samples = 1 + avail.checked_sub(SAMPLE_BYTES)? / pitch;
+        Some((base, pitch, samples))
     });
-    *data.sample_rate.lock() = data.format.as_ref().map(|format| format.rate() as i32);
-    if param.is_some() && data.format.is_none() {
-        error!("PipeWire negotiated an unusable audio format");
-        data.tx.take();
+    let samples = layout.clone().map(|p| p.map_or(0, |(_, _, n)| n)).min()?;
+    if samples == 0 {
+        return None;
+    }
+    let total = samples.checked_mul(SAMPLE_BYTES)?.checked_mul(channels)?;
+    if total > isize::MAX as usize {
+        return None;
+    }
+    let mut frame = Vec::with_capacity(total);
+    for plane in layout {
+        let (base, pitch, _) = plane?;
+        unsafe { append_rows(&mut frame, base, pitch, SAMPLE_BYTES, samples)? };
+    }
+    Some((frame, i32::try_from(samples).ok()?))
+}
+
+impl AudioData {
+    fn set_format(&mut self, param: Option<&Pod>) {
+        if self.tx.is_none() {
+            return;
+        }
+        self.format = param.and_then(|param| {
+            if parse_format(param).ok()? != (MediaType::Audio, MediaSubtype::Raw) {
+                return None;
+            }
+            let mut format = AudioInfoRaw::new();
+            format.parse(param).ok()?;
+            (format.format() == AudioFormat::F32P
+                && format.rate() as i32 > 0
+                && format.channels() as i32 > 0)
+                .then_some(format)
+        });
+        *self.sample_rate.lock() = self.format.as_ref().map(|format| format.rate() as i32);
+        if param.is_some() && self.format.is_none() {
+            // The stream can negotiate a usable format later. Its state callback owns shutdown.
+            error!("PipeWire negotiated an unusable audio format");
+        }
     }
 }
 
@@ -601,6 +705,86 @@ impl Drop for PipewireSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reused_node_id_cannot_replace_the_selected_stream() {
+        let waiting = TargetState::Waiting(StreamTarget::Serial(100));
+        assert_eq!(waiting.observe(100, Some("101")), waiting);
+        assert_eq!(waiting.observe(7, None), waiting);
+        assert_eq!(waiting.observe(7, Some("100")), TargetState::Present(7));
+        assert_eq!(TargetState::Gone.observe(7, Some("101")), TargetState::Gone);
+    }
+
+    #[test]
+    fn audio_can_renegotiate_after_an_unusable_format() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mut audio = AudioData {
+            tx: Some(tx),
+            format: None,
+            sample_rate: Arc::default(),
+        };
+        for (format, expected_rate) in [
+            (AudioFormat::F32P, Some(48000)),
+            (AudioFormat::S16LE, None),
+            (AudioFormat::F32P, Some(48000)),
+        ] {
+            let obj = object! {
+                SpaTypes::ObjectParamFormat, ParamType::Format,
+                property! { FormatProperties::MediaType, Id, MediaType::Audio },
+                property! { FormatProperties::MediaSubtype, Id, MediaSubtype::Raw },
+                property! { FormatProperties::AudioFormat, Id, format },
+                property! { FormatProperties::AudioRate, Int, 48000 },
+                property! { FormatProperties::AudioChannels, Int, 2 }
+            };
+            let bytes = serialize_pod(Value::Object(obj)).unwrap();
+            audio.set_format(Pod::from_bytes(&bytes));
+            assert_eq!(*audio.sample_rate.lock(), expected_rate);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
+    fn planar_audio_skips_padding_and_ends_at_the_shortest_channel() {
+        use pipewire::spa::sys::spa_chunk;
+
+        let left = [1u32, u32::MAX, 2];
+        let right = [3u32, 4, 5];
+        let pack = |stride| {
+            let mut left_chunk = spa_chunk {
+                offset: 0,
+                size: 12,
+                stride,
+                flags: 0,
+            };
+            let mut right_chunk = spa_chunk {
+                stride: 0,
+                ..left_chunk
+            };
+            let planes =
+                [(&left, &mut left_chunk), (&right, &mut right_chunk)].map(|(words, chunk)| {
+                    spa_data {
+                        type_: pipewire::spa::sys::SPA_DATA_MemPtr,
+                        flags: pipewire::spa::sys::SPA_DATA_FLAG_READABLE,
+                        fd: -1,
+                        mapoffset: 0,
+                        maxsize: size_of_val(words) as u32,
+                        data: words.as_ptr().cast_mut().cast(),
+                        chunk,
+                    }
+                });
+            unsafe { pack_audio_planes(planes.iter()) }
+        };
+        let expected = [1u32, 2, 3, 4]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect();
+        assert_eq!(pack(8), Some((expected, 2)));
+        assert_eq!(pack(2), None);
+        assert_eq!(pack(-4), None);
+    }
 
     #[test]
     fn negotiated_video_requires_a_supported_format_and_nonempty_size() {

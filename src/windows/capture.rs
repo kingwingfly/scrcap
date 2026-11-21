@@ -123,23 +123,40 @@ unsafe extern "system" fn collect_monitor(
 
 unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
-        if IsWindowVisible(hwnd).as_bool() {
-            let length = GetWindowTextLengthW(hwnd);
-            if length == 0 {
-                return TRUE;
-            }
-            let mut title = vec![0u16; length as usize + 1];
-            let len = GetWindowTextW(hwnd, &mut title) as usize;
-            if len > 0 {
-                let found = &mut *(lparam.0 as *mut (Regex, Option<HWND>));
-                if found.0.is_match(&String::from_utf16_lossy(&title[..len])) {
-                    found.1 = Some(hwnd);
-                    return FALSE;
-                }
+        if IsWindowVisible(hwnd).as_bool()
+            && let Some(title) = window_title(hwnd)
+        {
+            let found = &mut *(lparam.0 as *mut (Regex, Option<HWND>));
+            if found.0.is_match(&title) {
+                found.1 = Some(hwnd);
+                return FALSE;
             }
         }
     }
     TRUE
+}
+
+fn window_title(hwnd: HWND) -> Option<String> {
+    let length = unsafe { GetWindowTextLengthW(hwnd) };
+    if length <= 0 {
+        return None;
+    }
+    // Leave room for the terminator and one spare unit so a complete read is distinguishable
+    // from a title that grew between the two Win32 calls.
+    let mut capacity = length.checked_add(2)?;
+    let mut title = Vec::new();
+    loop {
+        title.try_reserve(capacity as usize - title.len()).ok()?;
+        title.resize(capacity as usize, 0);
+        let written = unsafe { GetWindowTextW(hwnd, &mut title) };
+        if written <= 0 {
+            return None;
+        }
+        if written < capacity - 1 {
+            return Some(String::from_utf16_lossy(&title[..written as usize]));
+        }
+        capacity = capacity.checked_mul(2)?;
+    }
 }
 
 fn window_by_title(pattern: &str) -> Result<HWND> {

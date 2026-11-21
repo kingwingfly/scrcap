@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use dbus::{
     Message, Path,
-    arg::{AppendAll, IterAppend, OwnedFd, PropMap, Variant},
+    arg::{AppendAll, Arg, IterAppend, OwnedFd, PropMap, Variant, cast},
     blocking::{BlockingSender, Connection},
     message::MatchRule,
 };
@@ -21,8 +21,31 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What a granted ScreenCast session hands over.
 pub struct Session {
-    pub node_id: u32,
+    pub target: StreamTarget,
     pub fd: OwnedFd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamTarget {
+    NodeId(u32),
+    Serial(u64),
+}
+
+fn stream_target(results: &PropMap) -> Option<StreamTarget> {
+    let streams = &results.get("streams")?.0;
+    if streams.signature() != Vec::<(u32, PropMap)>::signature()
+        || streams.as_static_inner(1).is_some()
+    {
+        return None;
+    }
+    let stream = streams.as_static_inner(0)?;
+    let props = cast::<PropMap>(stream.as_static_inner(1)?)?;
+    if let Some(serial) = props.get("pipewire-serial") {
+        return cast::<u64>(&serial.0).copied().map(StreamTarget::Serial);
+    }
+    // Older portals supply only a node ID. Zero is the core and u32::MAX means any node.
+    let id = *cast::<u32>(stream.as_static_inner(0)?)?;
+    (id != 0 && id != u32::MAX).then_some(StreamTarget::NodeId(id))
 }
 
 pub struct DbusScreen {
@@ -106,13 +129,9 @@ impl DbusScreen {
         }
         self.request(PortalCall::SelectSources, (handle.clone(), options))?;
         let results = self.request(PortalCall::Start, (handle.clone(), "", PropMap::new()))?;
-        let node_id = results
-            .get("streams")
-            .and_then(|streams| streams.0.as_iter()?.next()?.as_iter()?.next()?.as_u64())
-            .and_then(|id| u32::try_from(id).ok())
-            .ok_or(PortalError::MalformedReply {
-                call: PortalCall::Start,
-            })?;
+        let target = stream_target(&results).ok_or(PortalError::MalformedReply {
+            call: PortalCall::Start,
+        })?;
 
         let (fd,): (OwnedFd,) =
             proxy.method_call(SCREENCAST, "OpenPipeWireRemote", (handle, PropMap::new()))?;
@@ -121,7 +140,7 @@ impl DbusScreen {
             .remove_match_no_cb(&self.response.match_str())?;
         self.connection
             .remove_match_no_cb(&self.owner_changed.match_str())?;
-        Ok(Session { node_id, fd })
+        Ok(Session { target, fd })
     }
 
     fn request(&self, call: PortalCall, args: impl AppendAll) -> Result<PropMap> {
@@ -165,6 +184,52 @@ impl DbusScreen {
             {
                 return Err(PortalError::Vanished { call }.into());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbus::arg::RefArg;
+
+    fn target_from_wire(streams: impl RefArg + 'static) -> Option<StreamTarget> {
+        let mut results = PropMap::new();
+        results.insert("streams".into(), Variant(Box::new(streams)));
+        let message = Message::new_signal("/test", "org.example.Test", "Response")
+            .unwrap()
+            .append1(results);
+        stream_target(&message.read1().unwrap())
+    }
+
+    #[test]
+    fn prefers_the_full_serial_and_accepts_legacy_node_ids() {
+        let serial = u64::from(u32::MAX) + 42;
+        let mut props = PropMap::new();
+        props.insert("pipewire-serial".into(), Variant(Box::new(serial)));
+        assert_eq!(
+            target_from_wire(vec![(7u32, props)]),
+            Some(StreamTarget::Serial(serial))
+        );
+        assert_eq!(
+            target_from_wire(vec![(7u32, PropMap::new())]),
+            Some(StreamTarget::NodeId(7))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_ambiguous_streams() {
+        let mut props = PropMap::new();
+        props.insert("pipewire-serial".into(), Variant(Box::new(7u32)));
+        assert_eq!(target_from_wire(vec![(7u32, props)]), None);
+        assert_eq!(target_from_wire(vec![(7u32, 0u32)]), None);
+        assert_eq!(target_from_wire(Vec::<(u32, PropMap)>::new()), None);
+        assert_eq!(
+            target_from_wire(vec![(1u32, PropMap::new()), (2, PropMap::new())]),
+            None
+        );
+        for id in [0u32, u32::MAX] {
+            assert_eq!(target_from_wire(vec![(id, PropMap::new())]), None);
         }
     }
 }

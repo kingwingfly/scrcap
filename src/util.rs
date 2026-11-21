@@ -24,23 +24,42 @@ pub(crate) unsafe fn pack_rows(
     row_bytes: usize,
     height: usize,
 ) -> Option<Vec<u8>> {
+    let mut packed = Vec::new();
+    unsafe { append_rows(&mut packed, base, pitch, row_bytes, height)? };
+    Some(packed)
+}
+
+/// Append the initialized bytes from each row to an existing frame.
+///
+/// # Safety
+///
+/// The source must satisfy the same layout requirements as [`pack_rows`]
+/// and must not alias `packed`.
+pub(crate) unsafe fn append_rows(
+    packed: &mut Vec<u8>,
+    base: *const u8,
+    pitch: usize,
+    row_bytes: usize,
+    height: usize,
+) -> Option<()> {
     let span = row_span(pitch, row_bytes, height)?;
     if base.is_null() {
         return None;
     }
     unsafe {
         if pitch == row_bytes {
-            return Some(core::slice::from_raw_parts(base, span).to_vec());
+            packed.extend_from_slice(core::slice::from_raw_parts(base, span));
+        } else {
+            packed.reserve(row_bytes * height);
+            for row in 0..height {
+                packed.extend_from_slice(core::slice::from_raw_parts(
+                    base.add(row * pitch),
+                    row_bytes,
+                ));
+            }
         }
-        let mut packed = Vec::with_capacity(row_bytes * height);
-        for row in 0..height {
-            packed.extend_from_slice(core::slice::from_raw_parts(
-                base.add(row * pitch),
-                row_bytes,
-            ));
-        }
-        Some(packed)
     }
+    Some(())
 }
 
 #[cfg(test)]

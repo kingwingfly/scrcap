@@ -82,7 +82,10 @@ fn main() -> Result<()> {
 Two channels means two receivers to drain, so take whichever has a frame ready. Give audio
 the deeper capacity of the two. `sample_rate()` answers `None` until the system has settled
 the format, which on Linux and macOS happens after `create` returns -- every [`AudioFrame`]
-carries its own rate, so the first frame always answers it.
+carries its own rate, so the first frame always answers it. On Windows, switching the default
+output device -- or invalidating or reconfiguring the active endpoint (unplugged, disabled, or
+format-changed) -- re-binds loopback capture, so subsequent [`AudioFrame`]s may carry a new sample
+rate, channel count, or sample format.
 
 ```rust,no_run
 use crossbeam_channel::select;
@@ -101,20 +104,27 @@ fn main() -> Result<()> {
         }),
     };
     let capture = capture.create()?;
-    let audio = capture.audio().expect("audio was configured");
+    let mut audio = capture.audio();
 
     loop {
-        select! {
-            recv(capture.video()) -> frame => match frame {
+        match audio {
+            Some(audio_rx) => select! {
+                recv(capture.video()) -> frame => match frame {
+                    Ok(frame) => println!("video: {} bytes", frame.vframe.len()),
+                    Err(_) => break, // the capture ended
+                },
+                recv(audio_rx) -> frame => match frame {
+                    Ok(frame) => println!(
+                        "audio: {} samples of {:?} at {} Hz",
+                        frame.nb_samples, frame.sample_fmt, frame.sample_rate
+                    ),
+                    // Audio can end on its own while video keeps running; stop polling it.
+                    Err(_) => audio = None,
+                },
+            },
+            None => match capture.video().recv() {
                 Ok(frame) => println!("video: {} bytes", frame.vframe.len()),
                 Err(_) => break, // the capture ended
-            },
-            recv(audio) -> frame => match frame {
-                Ok(frame) => println!(
-                    "audio: {} samples of {:?} at {} Hz",
-                    frame.nb_samples, frame.sample_fmt, frame.sample_rate
-                ),
-                Err(_) => break,
             },
         }
     }
@@ -125,10 +135,18 @@ fn main() -> Result<()> {
 ## Letting the user choose
 
 `Target::Pick` raises the system picker and blocks until the user has chosen, so it must not
-run on the thread driving the UI: the Windows picker is parented to the `HWND` you pass, whose
-message pump would be the one blocked, and the macOS picker answers on the main queue. Linux
-always shows the portal's picker, whatever the target, and only `Primary`/`Monitor` (monitors
-only) and `Pick` (everything) narrow what it offers.
+run on the thread driving the UI:
+
+- **Windows**: Microsoft's `GraphicsCapturePicker::PickSingleItemAsync` formally recommends
+  invoking the picker on the UI thread without blocking its message loop. Because `scrcap`'s
+  synchronous `create` waits on `PickSingleItemAsync().join()` without pumping messages,
+  calling `create` on the thread that owns the parent `HWND` (or any other STA thread)
+  deadlocks its message pump — run `create` on a non-UI, non-STA worker thread instead while
+  the `HWND`'s thread keeps pumping messages.
+- **macOS**: the picker answers on the main queue, so calling `create` on the main thread
+  deadlocks.
+- **Linux**: the XDG portal always shows its picker regardless of target, and only
+  `Primary`/`Monitor` (monitors only) and `Pick` (everything) narrow what it offers.
 
 ```rust,no_run
 use std::thread;
@@ -210,7 +228,11 @@ the new one just hid.
 
 # Features
 
-- `dummy`: A dummy implementation that returns random 1080x720 images (`AV_PIX_FMT_BGRA`). No audio is produced.
+- `dummy`: **Test-only, non-additive.** Replaces the platform backend with a fake implementation
+  that generates random 1080x720 [`PixFmt::Bgra`] video frames (and silent 48 kHz stereo
+  [`SampleFmt::F32`] audio frames when `audio` is configured) and omits the `scrcap::platform`
+  module altogether. Because Cargo unifies features across the dependency graph, never enable
+  `dummy` in a library dependency or outside headless tests.
 
 # AI Involvement
 

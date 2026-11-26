@@ -1,17 +1,20 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicI32, Ordering},
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+    },
 };
 
 use crossbeam_channel::Sender;
 use crossbeam_utils::sync::Unparker;
 use objc2::{
-    AnyThread as _, DefinedClass as _, Message as _, define_class, msg_send, rc::Retained,
+    AnyThread as _, DefinedClass as _, define_class, msg_send, rc::Retained, runtime::AnyObject,
 };
 use objc2_core_audio_types::{
-    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsFloat,
-    kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
-    kAudioFormatLinearPCM,
+    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsBigEndian,
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
+    kAudioFormatFlagIsSignedInteger, kAudioFormatFlagsNativeEndian, kAudioFormatLinearPCM,
 };
 use objc2_core_media::{
     CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMClock, CMSampleBuffer,
@@ -19,13 +22,17 @@ use objc2_core_media::{
 };
 use objc2_core_video::{
     CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
-    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress, kCVReturnSuccess,
+    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferIsPlanar,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    kCVPixelFormatType_32BGRA, kCVReturnSuccess,
 };
-use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
+use objc2_foundation::{
+    NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString,
+};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver, SCStream,
-    SCStreamDelegate, SCStreamErrorCode, SCStreamErrorDomain, SCStreamOutput, SCStreamOutputType,
+    SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver, SCFrameStatus,
+    SCStream, SCStreamDelegate, SCStreamErrorCode, SCStreamErrorDomain, SCStreamFrameInfoStatus,
+    SCStreamOutput, SCStreamOutputType,
 };
 use parking_lot::Mutex;
 use tracing::error;
@@ -36,14 +43,37 @@ use crate::{
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
-    util::pack_rows,
+    util::{pack_rows, row_span},
 };
+
+/// Per-stream monotonic timestamp floor (in nanoseconds).
+///
+/// ScreenCaptureKit sample buffers can mix fallback `host_time_clock()` timestamps with
+/// slightly older queued capture `CMTime` PTS values; clamping to the last committed
+/// timestamp keeps each stream's published timestamps non-decreasing and prevents
+/// `FpsGate` from mistaking capture-vs-fallback jitter for a clock backward jump.
+#[derive(Debug, Default)]
+struct MonotonicFloor(AtomicU64);
+
+impl MonotonicFloor {
+    /// Raise `ts` to at least the last committed timestamp without advancing the floor.
+    fn clamp(&self, ts: u64) -> u64 {
+        ts.max(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Commit `ts` as the new floor if it is greater, returning the monotonic timestamp.
+    fn commit(&self, ts: u64) -> u64 {
+        self.0.fetch_max(ts, Ordering::Relaxed).max(ts)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct StreamOutput {
     v_tx: Sender<VideoFrame>,
     a_tx: Option<Sender<AudioFrame>>,
     gate: Mutex<FpsGate>,
+    last_video_ts: MonotonicFloor,
+    last_audio_ts: MonotonicFloor,
     size: Arc<AtomicSize>,
     sample_rate: Option<Arc<AtomicI32>>,
 }
@@ -77,9 +107,17 @@ define_class!(
                         if self.ivars().v_tx.is_full() {
                             return;
                         }
+                        if !is_complete_frame(sample_buffer) {
+                            return;
+                        }
                         let Some(buffer) = sample_buffer.image_buffer() else {
                             return;
                         };
+                        if CVPixelBufferGetPixelFormatType(&buffer) != kCVPixelFormatType_32BGRA
+                            || CVPixelBufferIsPlanar(&buffer)
+                        {
+                            return;
+                        }
                         if CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags::ReadOnly)
                             != kCVReturnSuccess
                         {
@@ -89,11 +127,25 @@ define_class!(
                         let width = CVPixelBufferGetWidth(&buffer);
                         let height = CVPixelBufferGetHeight(&buffer);
                         let addr = CVPixelBufferGetBaseAddress(&buffer);
-                        let row_bytes = width * 4;
-                        if addr.is_null()
-                            || bytes_per_row < row_bytes
-                            || !self.ivars().gate.lock().allow(ts)
-                        {
+                        let layout = (|| -> Option<(usize, u32, u32)> {
+                            if addr.is_null() {
+                                return None;
+                            }
+                            let row_bytes = width.checked_mul(4)?;
+                            row_span(bytes_per_row, row_bytes, height)?;
+                            let w = u32::try_from(width).ok()?;
+                            let h = u32::try_from(height).ok()?;
+                            Some((row_bytes, w, h))
+                        })();
+                        let Some((row_bytes, w, h)) = layout else {
+                            CVPixelBufferUnlockBaseAddress(
+                                &buffer,
+                                CVPixelBufferLockFlags::ReadOnly,
+                            );
+                            return;
+                        };
+                        let ts = self.ivars().last_video_ts.clamp(ts);
+                        if !self.ivars().gate.lock().allow(ts) {
                             CVPixelBufferUnlockBaseAddress(
                                 &buffer,
                                 CVPixelBufferLockFlags::ReadOnly,
@@ -105,10 +157,11 @@ define_class!(
                         let Some(vframe) = vframe else {
                             return;
                         };
-                        self.ivars().size.store(width as u32, height as u32);
+                        let ts = self.ivars().last_video_ts.commit(ts);
+                        self.ivars().size.store(w, h);
                         let _ = self.ivars().v_tx.try_send(VideoFrame {
                             vframe,
-                            size: (width as u32, height as u32),
+                            size: (w, h),
                             pix_fmt: PixFmt::Bgra,
                             ts,
                         });
@@ -154,6 +207,7 @@ define_class!(
                         ) else {
                             return;
                         };
+                        let ts = self.ivars().last_audio_ts.commit(ts);
                         let _ = a_tx.try_send(AudioFrame {
                             aframe,
                             nb_samples,
@@ -170,13 +224,44 @@ define_class!(
     }
 );
 
+/// Whether ScreenCaptureKit marked this sample buffer as a complete video frame.
+unsafe fn is_complete_frame(sample_buffer: &CMSampleBuffer) -> bool {
+    unsafe {
+        let Some(attachments) = sample_buffer.sample_attachments_array(false) else {
+            return false;
+        };
+        let attachments: &NSArray<AnyObject> = attachments.cast_unchecked::<AnyObject>().as_ref();
+        if attachments.is_empty() {
+            return false;
+        }
+        let first = attachments.objectAtIndex(0);
+        let Some(dict) = first.downcast_ref::<NSDictionary>() else {
+            return false;
+        };
+        let key: &AnyObject = &*(SCStreamFrameInfoStatus as *const NSString).cast();
+        let Some(status) = dict.objectForKey(key) else {
+            return false;
+        };
+        let Some(status) = status.downcast_ref::<NSNumber>() else {
+            return false;
+        };
+        SCFrameStatus(status.integerValue()) == SCFrameStatus::Complete
+    }
+}
+
 /// A `CMTime` as nanoseconds on the host clock.
 fn cm_time_ns(time: CMTime) -> Option<u64> {
     let (value, timescale, flags) = (time.value, time.timescale, time.flags);
-    if !flags.contains(CMTimeFlags::Valid) || timescale <= 0 || value < 0 {
+    if !flags.contains(CMTimeFlags::Valid)
+        || flags.intersects(CMTimeFlags::ImpliedValueFlagsMask)
+        || timescale <= 0
+        || value <= 0
+    {
         return None;
     }
-    Some((value as u128 * 1_000_000_000 / timescale as u128) as u64)
+    u64::try_from(value as u128 * 1_000_000_000 / timescale as u128)
+        .ok()
+        .filter(|&ns| ns > 0)
 }
 
 /// The [`SampleFmt`] an `AudioStreamBasicDescription` describes, if it is one we can name.
@@ -185,6 +270,9 @@ fn asbd_sample_fmt(asbd: &AudioStreamBasicDescription) -> Option<SampleFmt> {
         return None;
     }
     let flags = asbd.mFormatFlags;
+    if flags & kAudioFormatFlagIsBigEndian != kAudioFormatFlagsNativeEndian {
+        return None;
+    }
     let planar = flags & kAudioFormatFlagIsNonInterleaved != 0;
     let float = flags & kAudioFormatFlagIsFloat != 0;
     let signed = flags & kAudioFormatFlagIsSignedInteger != 0;
@@ -318,11 +406,31 @@ impl VideoStreamOutput {
                 v_tx,
                 a_tx,
                 gate: Mutex::new(FpsGate::new(fps)),
+                last_video_ts: MonotonicFloor::default(),
+                last_audio_ts: MonotonicFloor::default(),
                 size,
                 sample_rate,
             });
             msg_send![super(this), init]
         }
+    }
+}
+
+/// Map an `SCStreamErrorDomain` code to a [`CaptureError`].
+///
+/// Only `UserDeclined` maps to [`CaptureError::PermissionDenied`]; signing/entitlement errors
+/// such as `MissingEntitlements` (`-3803`) are not user Screen Recording TCC decisions and
+/// stay as [`ScreenCaptureKitError::Stream`].
+fn sc_stream_error(code: isize) -> CaptureError {
+    match SCStreamErrorCode(code) {
+        SCStreamErrorCode::UserDeclined => CaptureError::PermissionDenied,
+        SCStreamErrorCode::UserStopped | SCStreamErrorCode::SystemStoppedStream => {
+            ScreenCaptureKitError::Stopped.into()
+        }
+        SCStreamErrorCode::FailedToStart | SCStreamErrorCode::FailedToStartAudioCapture => {
+            ScreenCaptureKitError::FailedToStart.into()
+        }
+        _ => ScreenCaptureKitError::Stream(code).into(),
     }
 }
 
@@ -335,18 +443,7 @@ pub(crate) fn ns_error(e: &NSError) -> CaptureError {
     if &*e.domain() != unsafe { SCStreamErrorDomain } {
         return ScreenCaptureKitError::Other(code).into();
     }
-    match SCStreamErrorCode(code) {
-        SCStreamErrorCode::UserDeclined | SCStreamErrorCode::MissingEntitlements => {
-            CaptureError::PermissionDenied
-        }
-        SCStreamErrorCode::UserStopped | SCStreamErrorCode::SystemStoppedStream => {
-            ScreenCaptureKitError::Stopped.into()
-        }
-        SCStreamErrorCode::FailedToStart | SCStreamErrorCode::FailedToStartAudioCapture => {
-            ScreenCaptureKitError::FailedToStart.into()
-        }
-        _ => ScreenCaptureKitError::Stream(code).into(),
-    }
+    sc_stream_error(code)
 }
 
 #[derive(Debug)]
@@ -397,9 +494,20 @@ impl StreamDelegate {
     }
 }
 
-#[derive(Debug)]
+type PickerCallback = Box<dyn FnOnce(Result<&SCContentFilter>) + Send>;
+
 pub(crate) struct PickerObserverIvars {
-    tx: Sender<Result<Retained<SCContentFilter>>>,
+    /// One-shot callback invoked synchronously inside the observer method so the picker-owned
+    /// `SCContentFilter` is consumed in place without ever sending it across threads.
+    on_result: Mutex<Option<PickerCallback>>,
+}
+
+impl fmt::Debug for PickerObserverIvars {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PickerObserverIvars")
+            .field("pending", &self.on_result.lock().is_some())
+            .finish()
+    }
 }
 
 define_class!(
@@ -419,8 +527,10 @@ define_class!(
             filter: &SCContentFilter,
             stream: Option<&SCStream>,
         ) {
-            if stream.is_none() {
-                let _ = self.ivars().tx.try_send(Ok(filter.retain()));
+            if stream.is_none()
+                && let Some(on_result) = self.ivars().on_result.lock().take()
+            {
+                on_result(Ok(filter));
             }
         }
 
@@ -430,23 +540,185 @@ define_class!(
             _picker: &SCContentSharingPicker,
             stream: Option<&SCStream>,
         ) {
-            if stream.is_none() {
-                let _ = self.ivars().tx.try_send(Err(CaptureError::Cancelled));
+            if stream.is_none()
+                && let Some(on_result) = self.ivars().on_result.lock().take()
+            {
+                on_result(Err(CaptureError::Cancelled));
             }
         }
 
         #[unsafe(method(contentSharingPickerStartDidFailWithError:))]
         unsafe fn contentSharingPickerStartDidFailWithError(&self, error: &NSError) {
-            let _ = self.ivars().tx.try_send(Err(ns_error(error)));
+            if let Some(on_result) = self.ivars().on_result.lock().take() {
+                on_result(Err(ns_error(error)));
+            }
         }
     }
 );
 
 impl PickerObserver {
-    pub(crate) fn new(tx: Sender<Result<Retained<SCContentFilter>>>) -> Retained<Self> {
+    pub(crate) fn new(
+        on_result: impl FnOnce(Result<&SCContentFilter>) + Send + 'static,
+    ) -> Retained<Self> {
         unsafe {
-            let this = Self::alloc().set_ivars(PickerObserverIvars { tx });
+            let this = Self::alloc().set_ivars(PickerObserverIvars {
+                on_result: Mutex::new(Some(Box::new(on_result))),
+            });
             msg_send![super(this), init]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn time(value: i64, timescale: i32, flags: CMTimeFlags) -> CMTime {
+        CMTime {
+            value,
+            timescale,
+            flags,
+            epoch: 0,
+        }
+    }
+
+    #[test]
+    fn cm_time_ns_rejects_invalid_implied_non_positive_and_overflow() {
+        assert_eq!(
+            cm_time_ns(time(2, 1_000, CMTimeFlags::Valid)),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            cm_time_ns(time(1, 1, CMTimeFlags::Valid | CMTimeFlags::HasBeenRounded)),
+            Some(1_000_000_000)
+        );
+        assert_eq!(cm_time_ns(time(0, 1_000, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(-5, 1_000, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(5, 0, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(5, -1, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(5, 1, CMTimeFlags::empty())), None);
+        assert_eq!(
+            cm_time_ns(time(5, 1, CMTimeFlags::Valid | CMTimeFlags::Indefinite)),
+            None
+        );
+        assert_eq!(
+            cm_time_ns(time(
+                5,
+                1,
+                CMTimeFlags::Valid | CMTimeFlags::PositiveInfinity
+            )),
+            None
+        );
+        assert_eq!(
+            cm_time_ns(time(
+                5,
+                1,
+                CMTimeFlags::Valid | CMTimeFlags::NegativeInfinity
+            )),
+            None
+        );
+        assert_eq!(cm_time_ns(time(i64::MAX, 1, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(1, 2_000_000_000, CMTimeFlags::Valid)), None);
+    }
+
+    #[test]
+    fn asbd_sample_fmt_rejects_big_endian_lpcm() {
+        let make = |flags: u32, bits: u32| AudioStreamBasicDescription {
+            mSampleRate: 48_000.0,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: flags,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: bits,
+            mReserved: 0,
+        };
+        let f32_native = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        assert_eq!(asbd_sample_fmt(&make(f32_native, 32)), Some(SampleFmt::F32));
+        assert_eq!(
+            asbd_sample_fmt(&make(f32_native | kAudioFormatFlagIsNonInterleaved, 32)),
+            Some(SampleFmt::F32P)
+        );
+        assert_eq!(
+            asbd_sample_fmt(&make(f32_native | kAudioFormatFlagIsBigEndian, 32)),
+            None
+        );
+        let s16_native = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+        assert_eq!(asbd_sample_fmt(&make(s16_native, 16)), Some(SampleFmt::S16));
+        assert_eq!(
+            asbd_sample_fmt(&make(s16_native | kAudioFormatFlagIsBigEndian, 16)),
+            None
+        );
+    }
+
+    #[test]
+    fn monotonic_floor_clamps_backward_jitter_without_advancing_until_committed() {
+        let floor = MonotonicFloor::default();
+        assert_eq!(floor.clamp(0), 0);
+        assert_eq!(floor.clamp(1_000), 1_000);
+        // Uncommitted clamp does not move the floor.
+        assert_eq!(floor.clamp(500), 500);
+
+        assert_eq!(floor.commit(1_000_000_000), 1_000_000_000);
+        assert_eq!(floor.clamp(950_000_000), 1_000_000_000);
+        assert_eq!(floor.commit(950_000_000), 1_000_000_000);
+        assert_eq!(floor.clamp(1_016_666_666), 1_016_666_666);
+        // Still uncommitted, so an older timestamp clamps to the last committed floor.
+        assert_eq!(floor.clamp(1_005_000_000), 1_005_000_000);
+        assert_eq!(floor.commit(1_016_666_666), 1_016_666_666);
+        assert_eq!(floor.clamp(1_005_000_000), 1_016_666_666);
+        assert_eq!(floor.commit(u64::MAX), u64::MAX);
+        assert_eq!(floor.clamp(0), u64::MAX);
+    }
+
+    #[test]
+    fn monotonic_floor_prevents_fps_gate_backward_reanchor_and_underflow() {
+        // Fallback host clock at 1.000s followed by a queued capture PTS >2 frames earlier:
+        // clamping before `FpsGate` prevents backward re-anchoring and keeps timestamps monotonic.
+        let floor = MonotonicFloor::default();
+        let mut gate = FpsGate::new(Some(60));
+
+        let start = floor.clamp(1_000_000_000);
+        assert!(gate.allow(start));
+        let start = floor.commit(start);
+
+        let stale = floor.clamp(960_000_000);
+        assert_eq!(stale, start);
+        assert!(!gate.allow(stale));
+
+        // Even uncapped streams never emit a timestamp earlier than `start`.
+        let mut uncapped = FpsGate::new(None);
+        assert!(uncapped.allow(start));
+        assert!(uncapped.allow(stale));
+        assert_eq!(stale - start, 0);
+
+        // Normal forward progression resumes on the next interval.
+        let next = floor.clamp(1_017_000_000);
+        assert!(gate.allow(next));
+        let next = floor.commit(next);
+        assert_eq!(next, 1_017_000_000);
+        assert_eq!(next - start, 17_000_000);
+    }
+
+    #[test]
+    fn sc_stream_error_keeps_missing_entitlements_distinct_from_permission_denied() {
+        assert!(matches!(
+            sc_stream_error(SCStreamErrorCode::UserDeclined.0),
+            CaptureError::PermissionDenied
+        ));
+        assert!(matches!(
+            sc_stream_error(SCStreamErrorCode::MissingEntitlements.0),
+            CaptureError::ScreenCaptureKit(ScreenCaptureKitError::Stream(code))
+                if code == SCStreamErrorCode::MissingEntitlements.0
+        ));
+        assert!(matches!(
+            sc_stream_error(SCStreamErrorCode::UserStopped.0),
+            CaptureError::ScreenCaptureKit(ScreenCaptureKitError::Stopped)
+        ));
+        assert!(matches!(
+            sc_stream_error(SCStreamErrorCode::FailedToStart.0),
+            CaptureError::ScreenCaptureKit(ScreenCaptureKitError::FailedToStart)
+        ));
     }
 }

@@ -60,6 +60,11 @@ impl VFrame for VideoFrame {
 }
 
 /// Owned audio frame.
+///
+/// On Windows, switching the default output device -- or invalidating or reconfiguring the active
+/// endpoint (unplugged, disabled, or format-changed) -- re-binds WASAPI loopback capture, so
+/// subsequent frames in the same session may carry a new `sample_rate`, `nb_channels`, or
+/// `sample_fmt`.
 #[derive(Clone)]
 pub struct AudioFrame {
     /// Audio data

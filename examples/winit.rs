@@ -19,7 +19,9 @@ use winit::{
     window::{Window, WindowId, WindowLevel},
 };
 
-use scrcap::{CaptureConfig, CaptureDesc, CaptureDescriptor as _, Target, VideoConfig, VideoFrame};
+use scrcap::{
+    CaptureConfig, CaptureDesc, CaptureDescriptor as _, PixFmt, Target, VideoConfig, VideoFrame,
+};
 
 fn main() {
     env_logger::builder()
@@ -259,6 +261,14 @@ impl State {
             .find(|f| f.is_srgb())
             .copied()
             .unwrap_or(surface_caps.formats[0]);
+        let alpha_mode = if surface_caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::Opaque)
+        {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            surface_caps.alpha_modes[0]
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -266,7 +276,7 @@ impl State {
             width: size.width,
             height: size.height,
             present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -394,6 +404,7 @@ impl State {
         let (width, height) = capture_desc.size();
         self.resize_texture(width, height);
         self.capture_desc = Some(capture_desc);
+        self.window.request_redraw();
     }
 
     fn resize_texture(&mut self, width: u32, height: u32) {
@@ -427,7 +438,9 @@ impl State {
         if !self.is_surface_configured {
             return true;
         }
-        self.window.request_redraw();
+        if self.capture_desc.is_some() {
+            self.window.request_redraw();
+        }
 
         // `get_current_texture` no longer returns a `Result`; every outcome, including
         // the ones that used to be a `SurfaceError`, is a `CurrentSurfaceTexture` variant.
@@ -436,7 +449,13 @@ impl State {
             // Usable, but the surface wants reconfiguring before the next frame.
             CurrentSurfaceTexture::Suboptimal(output) => (output, true),
             // Nothing to draw into right now; try again on the next redraw.
-            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return true,
+            CurrentSurfaceTexture::Timeout => {
+                if !self.presented {
+                    self.window.request_redraw();
+                }
+                return true;
+            }
+            CurrentSurfaceTexture::Occluded => return true,
             CurrentSurfaceTexture::Lost => {
                 self.surface = match self.instance.create_surface(self.window.clone()) {
                     Ok(surface) => surface,
@@ -482,7 +501,7 @@ impl State {
                             r: 1.0,
                             g: 1.0,
                             b: 1.0,
-                            a: 0.0,
+                            a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -541,7 +560,19 @@ impl State {
                 return false;
             }
         };
-        let VideoFrame { vframe, size, .. } = frame;
+        let VideoFrame {
+            vframe,
+            size,
+            pix_fmt,
+            ..
+        } = frame;
+        match pix_fmt {
+            PixFmt::Bgra | PixFmt::Bgr0 => {}
+            other => {
+                warn!("skipping unsupported pixel format: {other:?}");
+                return true;
+            }
+        }
         // `write_texture` panics on an extent mismatch, and the source can resize mid-capture.
         if (size.0, size.1)
             != (

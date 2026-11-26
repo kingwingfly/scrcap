@@ -7,11 +7,12 @@ use crossbeam_channel::Sender;
 use crossbeam_utils::sync::Unparker;
 use objc2::{
     AnyThread as _, DefinedClass as _, Message as _, define_class, msg_send, rc::Retained,
+    runtime::AnyObject,
 };
 use objc2_core_audio_types::{
-    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsFloat,
-    kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
-    kAudioFormatLinearPCM,
+    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsBigEndian,
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
+    kAudioFormatFlagIsSignedInteger, kAudioFormatFlagsNativeEndian, kAudioFormatLinearPCM,
 };
 use objc2_core_media::{
     CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMClock, CMSampleBuffer,
@@ -19,13 +20,17 @@ use objc2_core_media::{
 };
 use objc2_core_video::{
     CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
-    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress, kCVReturnSuccess,
+    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferIsPlanar,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    kCVPixelFormatType_32BGRA, kCVReturnSuccess,
 };
-use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
+use objc2_foundation::{
+    NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString,
+};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver, SCStream,
-    SCStreamDelegate, SCStreamErrorCode, SCStreamErrorDomain, SCStreamOutput, SCStreamOutputType,
+    SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver, SCFrameStatus,
+    SCStream, SCStreamDelegate, SCStreamErrorCode, SCStreamErrorDomain, SCStreamFrameInfoStatus,
+    SCStreamOutput, SCStreamOutputType,
 };
 use parking_lot::Mutex;
 use tracing::error;
@@ -36,7 +41,7 @@ use crate::{
     format::{PixFmt, SampleFmt},
     fps::FpsGate,
     frame::{AudioFrame, VideoFrame},
-    util::pack_rows,
+    util::{pack_rows, row_span},
 };
 
 #[derive(Debug)]
@@ -77,9 +82,17 @@ define_class!(
                         if self.ivars().v_tx.is_full() {
                             return;
                         }
+                        if !is_complete_frame(sample_buffer) {
+                            return;
+                        }
                         let Some(buffer) = sample_buffer.image_buffer() else {
                             return;
                         };
+                        if CVPixelBufferGetPixelFormatType(&buffer) != kCVPixelFormatType_32BGRA
+                            || CVPixelBufferIsPlanar(&buffer)
+                        {
+                            return;
+                        }
                         if CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags::ReadOnly)
                             != kCVReturnSuccess
                         {
@@ -89,11 +102,24 @@ define_class!(
                         let width = CVPixelBufferGetWidth(&buffer);
                         let height = CVPixelBufferGetHeight(&buffer);
                         let addr = CVPixelBufferGetBaseAddress(&buffer);
-                        let row_bytes = width * 4;
-                        if addr.is_null()
-                            || bytes_per_row < row_bytes
-                            || !self.ivars().gate.lock().allow(ts)
-                        {
+                        let layout = (|| -> Option<(usize, u32, u32)> {
+                            if addr.is_null() {
+                                return None;
+                            }
+                            let row_bytes = width.checked_mul(4)?;
+                            row_span(bytes_per_row, row_bytes, height)?;
+                            let w = u32::try_from(width).ok()?;
+                            let h = u32::try_from(height).ok()?;
+                            Some((row_bytes, w, h))
+                        })();
+                        let Some((row_bytes, w, h)) = layout else {
+                            CVPixelBufferUnlockBaseAddress(
+                                &buffer,
+                                CVPixelBufferLockFlags::ReadOnly,
+                            );
+                            return;
+                        };
+                        if !self.ivars().gate.lock().allow(ts) {
                             CVPixelBufferUnlockBaseAddress(
                                 &buffer,
                                 CVPixelBufferLockFlags::ReadOnly,
@@ -105,10 +131,10 @@ define_class!(
                         let Some(vframe) = vframe else {
                             return;
                         };
-                        self.ivars().size.store(width as u32, height as u32);
+                        self.ivars().size.store(w, h);
                         let _ = self.ivars().v_tx.try_send(VideoFrame {
                             vframe,
-                            size: (width as u32, height as u32),
+                            size: (w, h),
                             pix_fmt: PixFmt::Bgra,
                             ts,
                         });
@@ -170,13 +196,44 @@ define_class!(
     }
 );
 
+/// Whether ScreenCaptureKit marked this sample buffer as a complete video frame.
+unsafe fn is_complete_frame(sample_buffer: &CMSampleBuffer) -> bool {
+    unsafe {
+        let Some(attachments) = sample_buffer.sample_attachments_array(false) else {
+            return false;
+        };
+        let attachments: &NSArray<AnyObject> = attachments.cast_unchecked::<AnyObject>().as_ref();
+        if attachments.is_empty() {
+            return false;
+        }
+        let first = attachments.objectAtIndex(0);
+        let Some(dict) = first.downcast_ref::<NSDictionary>() else {
+            return false;
+        };
+        let key: &AnyObject = &*(SCStreamFrameInfoStatus as *const NSString).cast();
+        let Some(status) = dict.objectForKey(key) else {
+            return false;
+        };
+        let Some(status) = status.downcast_ref::<NSNumber>() else {
+            return false;
+        };
+        SCFrameStatus(status.integerValue()) == SCFrameStatus::Complete
+    }
+}
+
 /// A `CMTime` as nanoseconds on the host clock.
 fn cm_time_ns(time: CMTime) -> Option<u64> {
     let (value, timescale, flags) = (time.value, time.timescale, time.flags);
-    if !flags.contains(CMTimeFlags::Valid) || timescale <= 0 || value < 0 {
+    if !flags.contains(CMTimeFlags::Valid)
+        || flags.intersects(CMTimeFlags::ImpliedValueFlagsMask)
+        || timescale <= 0
+        || value <= 0
+    {
         return None;
     }
-    Some((value as u128 * 1_000_000_000 / timescale as u128) as u64)
+    u64::try_from(value as u128 * 1_000_000_000 / timescale as u128)
+        .ok()
+        .filter(|&ns| ns > 0)
 }
 
 /// The [`SampleFmt`] an `AudioStreamBasicDescription` describes, if it is one we can name.
@@ -185,6 +242,9 @@ fn asbd_sample_fmt(asbd: &AudioStreamBasicDescription) -> Option<SampleFmt> {
         return None;
     }
     let flags = asbd.mFormatFlags;
+    if flags & kAudioFormatFlagIsBigEndian != kAudioFormatFlagsNativeEndian {
+        return None;
+    }
     let planar = flags & kAudioFormatFlagIsNonInterleaved != 0;
     let float = flags & kAudioFormatFlagIsFloat != 0;
     let signed = flags & kAudioFormatFlagIsSignedInteger != 0;
@@ -448,5 +508,89 @@ impl PickerObserver {
             let this = Self::alloc().set_ivars(PickerObserverIvars { tx });
             msg_send![super(this), init]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn time(value: i64, timescale: i32, flags: CMTimeFlags) -> CMTime {
+        CMTime {
+            value,
+            timescale,
+            flags,
+            epoch: 0,
+        }
+    }
+
+    #[test]
+    fn cm_time_ns_rejects_invalid_implied_non_positive_and_overflow() {
+        assert_eq!(
+            cm_time_ns(time(2, 1_000, CMTimeFlags::Valid)),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            cm_time_ns(time(1, 1, CMTimeFlags::Valid | CMTimeFlags::HasBeenRounded)),
+            Some(1_000_000_000)
+        );
+        assert_eq!(cm_time_ns(time(0, 1_000, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(-5, 1_000, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(5, 0, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(5, -1, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(5, 1, CMTimeFlags::empty())), None);
+        assert_eq!(
+            cm_time_ns(time(5, 1, CMTimeFlags::Valid | CMTimeFlags::Indefinite)),
+            None
+        );
+        assert_eq!(
+            cm_time_ns(time(
+                5,
+                1,
+                CMTimeFlags::Valid | CMTimeFlags::PositiveInfinity
+            )),
+            None
+        );
+        assert_eq!(
+            cm_time_ns(time(
+                5,
+                1,
+                CMTimeFlags::Valid | CMTimeFlags::NegativeInfinity
+            )),
+            None
+        );
+        assert_eq!(cm_time_ns(time(i64::MAX, 1, CMTimeFlags::Valid)), None);
+        assert_eq!(cm_time_ns(time(1, 2_000_000_000, CMTimeFlags::Valid)), None);
+    }
+
+    #[test]
+    fn asbd_sample_fmt_rejects_big_endian_lpcm() {
+        let make = |flags: u32, bits: u32| AudioStreamBasicDescription {
+            mSampleRate: 48_000.0,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: flags,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: bits,
+            mReserved: 0,
+        };
+        let f32_native = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        assert_eq!(asbd_sample_fmt(&make(f32_native, 32)), Some(SampleFmt::F32));
+        assert_eq!(
+            asbd_sample_fmt(&make(f32_native | kAudioFormatFlagIsNonInterleaved, 32)),
+            Some(SampleFmt::F32P)
+        );
+        assert_eq!(
+            asbd_sample_fmt(&make(f32_native | kAudioFormatFlagIsBigEndian, 32)),
+            None
+        );
+        let s16_native = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+        assert_eq!(asbd_sample_fmt(&make(s16_native, 16)), Some(SampleFmt::S16));
+        assert_eq!(
+            asbd_sample_fmt(&make(s16_native | kAudioFormatFlagIsBigEndian, 16)),
+            None
+        );
     }
 }

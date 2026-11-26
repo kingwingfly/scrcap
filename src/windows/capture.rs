@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -20,29 +20,34 @@ use windows::{
         SizeInt32,
     },
     Win32::{
-        Foundation::{FALSE, HMODULE, HWND, LPARAM, POINT, RECT, TRUE},
+        Foundation::{ERROR_NOT_FOUND, FALSE, HMODULE, HWND, LPARAM, POINT, RECT, TRUE},
         Graphics::{
             Direct3D::{
                 self, D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
             },
             Direct3D11::{
-                D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
-                ID3D11Device, ID3D11Texture2D,
+                D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+                D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+                ID3D11Texture2D,
             },
             Dxgi::{
                 DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
                 IDXGIDevice,
             },
-            Gdi::{EnumDisplayMonitors, HDC, HMONITOR, MONITOR_DEFAULTTONULL, MonitorFromPoint},
+            Gdi::{
+                EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONULL,
+                MONITORINFO, MonitorFromPoint,
+            },
         },
         Media::{
             Audio::{
                 AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR,
-                AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient,
-                IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM,
-                WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
+                AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_ENDPOINT_CREATE_FAILED,
+                AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_S_BUFFER_EMPTY, AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient,
+                IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX,
+                WAVEFORMATEXTENSIBLE, eConsole, eRender,
             },
             KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE},
             Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
@@ -53,23 +58,24 @@ use windows::{
                 CoUninitialize,
             },
             Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
-            Threading::GetCurrentThreadId,
             WinRT::{
                 Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
                 Graphics::Capture::IGraphicsCaptureItemInterop,
             },
         },
-        UI::Shell::IInitializeWithWindow,
-        UI::WindowsAndMessaging::{
-            DispatchMessageW, EnumWindows, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
-            IsWindowVisible, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WM_NULL, WM_USER,
+        UI::{
+            Shell::IInitializeWithWindow,
+            WindowsAndMessaging::{
+                EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindow, IsWindowVisible,
+                MONITORINFOF_PRIMARY,
+            },
         },
     },
-    core::{BOOL, HSTRING, IInspectable, Interface as _, factory},
+    core::{BOOL, HRESULT, HSTRING, IInspectable, Interface, factory},
 };
 
 use regex::Regex;
-use tracing::error;
+use tracing::{error, warn};
 
 use super::utils::{HideToken, hide_window_from_capture, unhide_window};
 use crate::{
@@ -121,17 +127,23 @@ unsafe extern "system" fn collect_monitor(
     TRUE
 }
 
+struct WindowSearch<'a> {
+    re: Regex,
+    hide: &'a [isize],
+    found: Option<HWND>,
+}
+
 unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    unsafe {
-        if IsWindowVisible(hwnd).as_bool()
-            && let Some(title) = window_title(hwnd)
-        {
-            let found = &mut *(lparam.0 as *mut (Regex, Option<HWND>));
-            if found.0.is_match(&title) {
-                found.1 = Some(hwnd);
-                return FALSE;
-            }
-        }
+    let search = unsafe { &mut *(lparam.0 as *mut WindowSearch<'_>) };
+    if search.hide.contains(&(hwnd.0 as isize)) {
+        return TRUE;
+    }
+    if unsafe { IsWindowVisible(hwnd) }.as_bool()
+        && let Some(title) = window_title(hwnd)
+        && search.re.is_match(&title)
+    {
+        search.found = Some(hwnd);
+        return FALSE;
     }
     TRUE
 }
@@ -159,13 +171,40 @@ fn window_title(hwnd: HWND) -> Option<String> {
     }
 }
 
-fn window_by_title(pattern: &str) -> Result<HWND> {
+fn window_by_title(pattern: &str, hide: &[isize]) -> Result<HWND> {
     let re = Regex::new(pattern).map_err(CaptureError::BadWindowRegex)?;
-    let mut found = (re, None);
+    let mut search = WindowSearch {
+        re,
+        hide,
+        found: None,
+    };
     unsafe {
-        let _ = EnumWindows(Some(collect_window), LPARAM(&mut found as *mut _ as isize));
+        let _ = EnumWindows(
+            Some(collect_window),
+            LPARAM(&mut search as *mut WindowSearch<'_> as isize),
+        );
     }
-    found.1.ok_or(CaptureError::TargetNotFound)
+    search.found.ok_or(CaptureError::TargetNotFound)
+}
+
+fn monitor_sort_key(monitor: HMONITOR) -> (bool, i32, i32, usize) {
+    let mut info = MONITORINFO {
+        cbSize: core::mem::size_of::<MONITORINFO>() as u32,
+        rcMonitor: RECT::default(),
+        rcWork: RECT::default(),
+        dwFlags: 0,
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        let is_primary = info.dwFlags & MONITORINFOF_PRIMARY != 0;
+        (
+            !is_primary,
+            info.rcMonitor.left,
+            info.rcMonitor.top,
+            monitor.0 as usize,
+        )
+    } else {
+        (true, i32::MAX, i32::MAX, monitor.0 as usize)
+    }
 }
 
 fn monitor_from_index(index: isize) -> Result<HMONITOR> {
@@ -182,13 +221,14 @@ fn monitor_from_index(index: isize) -> Result<HMONITOR> {
         )
         .ok()?;
     }
+    monitors.sort_by_cached_key(|&monitor| monitor_sort_key(monitor));
     monitors
         .get(index as usize)
         .copied()
         .ok_or(CaptureError::TargetNotFound)
 }
 
-fn capture_item(target: Target) -> Result<GraphicsCaptureItem> {
+fn capture_item(target: Target, hide: &[isize]) -> Result<GraphicsCaptureItem> {
     let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     Ok(match target {
         Target::Primary => {
@@ -202,9 +242,15 @@ fn capture_item(target: Target) -> Result<GraphicsCaptureItem> {
             let monitor = monitor_from_index(index)?;
             unsafe { interop.CreateForMonitor(monitor)? }
         }
-        Target::Window(hwnd) => unsafe { interop.CreateForWindow(HWND(hwnd as _))? },
+        Target::Window(hwnd) => {
+            let handle = HWND(hwnd as _);
+            if hwnd == 0 || hide.contains(&hwnd) || !unsafe { IsWindow(Some(handle)) }.as_bool() {
+                return Err(CaptureError::TargetNotFound);
+            }
+            unsafe { interop.CreateForWindow(handle)? }
+        }
         Target::WindowName(pattern) => {
-            let hwnd = window_by_title(&pattern)?;
+            let hwnd = window_by_title(&pattern, hide)?;
             unsafe { interop.CreateForWindow(hwnd)? }
         }
         Target::Pick(parent) => {
@@ -234,6 +280,207 @@ fn restore_hidden(hidden: &[HideToken]) {
     }
 }
 
+fn is_device_lost(err: &windows::core::Error) -> bool {
+    matches!(
+        err.code(),
+        DXGI_ERROR_DEVICE_REMOVED | DXGI_ERROR_DEVICE_RESET | DXGI_ERROR_DEVICE_HUNG
+    )
+}
+
+/// State owned by the `FrameArrived` callback while the capture is live.
+///
+/// Wrapped in `Arc<Mutex<Option<FrameState>>>` so teardown can take it under the lock,
+/// waiting for any in-flight `CreateFreeThreaded` callback to finish and preventing any
+/// late callback from touching the pool, D3D11 context, or video channel after teardown.
+struct FrameState {
+    tx: Sender<VideoFrame>,
+    gate: FpsGate,
+    d3d_device: ID3D11Device,
+    d3d_device_context: ID3D11DeviceContext,
+    staging: Option<(ID3D11Texture2D, u32, u32)>,
+    pool_size: SizeInt32,
+    size: Arc<Mutex<(u32, u32)>>,
+}
+
+impl FrameState {
+    /// Copy one frame out, cropped to `content`.
+    fn copy_frame(
+        &mut self,
+        frame: &Direct3D11CaptureFrame,
+        content: SizeInt32,
+    ) -> windows::core::Result<()> {
+        // Only ContentSize pixels are defined, including on the resize frame still backed
+        // by the old pool texture.
+        if content.Width <= 0 || content.Height <= 0 {
+            return Ok(());
+        }
+        let ts = frame
+            .SystemRelativeTime()
+            .ok()
+            .and_then(|t| u64::try_from(t.Duration).ok())
+            .filter(|&t| t > 0)
+            .and_then(|t| t.checked_mul(100))
+            .unwrap_or_else(qpc_now);
+        // A full channel would drop the frame anyway; skip the readback.
+        if self.tx.is_full() || !self.gate.allow(ts) {
+            return Ok(());
+        }
+        let surface = frame.Surface()?;
+        let interface = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
+        let texture = unsafe { interface.GetInterface::<ID3D11Texture2D>()? };
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut desc) };
+        // This frame was allocated at the pool's *old* size, and only the top-left
+        // `ContentSize` of it is defined, so a source that has shrunk is cropped rather
+        // than copied whole. Recreating the pool only fixes the frames after this one.
+        let width = desc.Width.min(content.Width as u32);
+        let height = desc.Height.min(content.Height as u32);
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let Some(row_bytes) = (width as usize).checked_mul(4) else {
+            return Ok(());
+        };
+
+        let cpu_texture = match self.staging.as_ref() {
+            Some((texture, w, h)) if *w == width && *h == height => texture.clone(),
+            _ => {
+                let cpu_desc = D3D11_TEXTURE2D_DESC {
+                    Width: width,
+                    Height: height,
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                    ..desc
+                };
+                let mut cpu_texture = None;
+                unsafe {
+                    self.d3d_device
+                        .CreateTexture2D(&cpu_desc, None, Some(&mut cpu_texture))?;
+                }
+                let cpu_texture = cpu_texture.ok_or_else(|| {
+                    windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)
+                })?;
+                self.staging = Some((cpu_texture.clone(), width, height));
+                *self.size.lock() = (width, height);
+                cpu_texture
+            }
+        };
+        unsafe {
+            self.d3d_device_context.CopySubresourceRegion(
+                &cpu_texture,
+                0,
+                0,
+                0,
+                0,
+                &texture,
+                0,
+                Some(&D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    front: 0,
+                    right: width,
+                    bottom: height,
+                    back: 1,
+                }),
+            );
+        }
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.d3d_device_context
+                .Map(&cpu_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        }
+        let pitch = mapped.RowPitch as usize;
+        let rows = height as usize;
+        let vframe = unsafe { pack_rows(mapped.pData as *const u8, pitch, row_bytes, rows) };
+        unsafe { self.d3d_device_context.Unmap(&cpu_texture, 0) };
+        let Some(vframe) = vframe else {
+            return Ok(());
+        };
+        let _ = self.tx.try_send(VideoFrame {
+            vframe,
+            size: (width, height),
+            pix_fmt: PixFmt::Bgra,
+            ts,
+        });
+        Ok(())
+    }
+
+    fn on_frame(&mut self, pool: &Direct3D11CaptureFramePool) -> windows::core::Result<()> {
+        let frame = match pool.TryGetNextFrame() {
+            Ok(frame) => frame,
+            // An empty pool yields a null frame, which windows-rs surfaces as a success-coded error.
+            Err(e) if e.code().is_ok() => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        // The pool keeps handing out textures of the size it was made with, clipping or
+        // padding a source that has since resized, so a change means recreating it -- but
+        // not before this frame, which belongs to the generation being replaced, has gone
+        // back to the pool. The copy's outcome is carried past that, so a resize is
+        // followed up whichever way the copy went, including the early return on a full
+        // channel.
+        let content = match frame.ContentSize() {
+            Ok(content) => content,
+            Err(e) => {
+                let _ = frame.Close();
+                return Err(e);
+            }
+        };
+        let copied = self.copy_frame(&frame, content);
+        let _ = frame.Close();
+        drop(frame);
+        if let Err(ref e) = copied
+            && is_device_lost(e)
+        {
+            return copied;
+        }
+        if content.Width > 0 && content.Height > 0 && content != self.pool_size {
+            pool.Recreate(
+                &winrt_device(&self.d3d_device)?,
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                3,
+                content,
+            )?;
+            self.pool_size = content;
+        }
+        copied
+    }
+}
+
+/// Owns the live WGC objects on the video worker thread and tears them down in a safe,
+/// synchronized order on both normal exit and partial setup failure.
+struct CaptureTeardown {
+    session: Option<GraphicsCaptureSession>,
+    pool: Direct3D11CaptureFramePool,
+    item: GraphicsCaptureItem,
+    state: Arc<Mutex<Option<FrameState>>>,
+    frame_token: Option<i64>,
+    closed_token: Option<i64>,
+    terminate: Arc<AtomicBool>,
+}
+
+impl Drop for CaptureTeardown {
+    fn drop(&mut self) {
+        self.terminate.store(true, Ordering::Release);
+        if let Some(token) = self.closed_token.take() {
+            let _ = self.item.RemoveClosed(token);
+        }
+        if let Some(token) = self.frame_token.take() {
+            let _ = self.pool.RemoveFrameArrived(token);
+        }
+        // Wait for any in-flight `FrameArrived` callback to leave `on_frame` and prevent
+        // late callbacks from touching `pool`, `d3d_device_context`, or `tx`.
+        let taken = self.state.lock().take();
+        if let Some(session) = self.session.as_ref() {
+            let _ = session.Close();
+        }
+        let _ = self.pool.Close();
+        drop(taken);
+    }
+}
+
 impl VideoConfig {
     /// Create a new capture configuration.
     fn create(
@@ -259,7 +506,7 @@ impl VideoConfig {
             }
         }
 
-        let item = match capture_item(self.target) {
+        let item = match capture_item(self.target, &self.hide) {
             Ok(item) => item,
             Err(e) => {
                 restore_hidden(&hidden);
@@ -275,34 +522,39 @@ impl VideoConfig {
             }
         };
         let size = Arc::new(Mutex::new((
-            item_size.Width as u32,
-            item_size.Height as u32,
+            item_size.Width.max(0) as u32,
+            item_size.Height.max(0) as u32,
         )));
 
-        let (setup_tx, setup_rx) = bounded::<Result<u32>>(1);
+        let (wake_tx, wake_rx) = bounded::<()>(1);
+        let (setup_tx, setup_rx) = bounded::<Result<()>>(1);
 
         let desc_terminate = terminate.clone();
-        let jh = thread::spawn(unsafe {
-            let size = size.clone();
-            let setup_tx = setup_tx.clone();
-            move || {
-                let setup =
-                    (|| -> Result<(Direct3D11CaptureFramePool, GraphicsCaptureSession, i64)> {
+        let jh = match thread::Builder::new()
+            .name("scrcap-video".to_string())
+            .spawn({
+                let size = size.clone();
+                let setup_tx = setup_tx.clone();
+                let wake_tx = wake_tx.clone();
+                move || {
+                    let setup = (|| -> Result<CaptureTeardown> {
                         const FEATURE_FLAGS: [Direct3D::D3D_FEATURE_LEVEL; 2] =
                             [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
                         let mut d3d_device = None;
                         let mut d3d_device_context = None;
-                        D3D11CreateDevice(
-                            None,
-                            D3D_DRIVER_TYPE_HARDWARE,
-                            HMODULE::default(),
-                            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                            Some(&FEATURE_FLAGS),
-                            D3D11_SDK_VERSION,
-                            Some(&mut d3d_device),
-                            None,
-                            Some(&mut d3d_device_context),
-                        )?;
+                        unsafe {
+                            D3D11CreateDevice(
+                                None,
+                                D3D_DRIVER_TYPE_HARDWARE,
+                                HMODULE::default(),
+                                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                Some(&FEATURE_FLAGS),
+                                D3D11_SDK_VERSION,
+                                Some(&mut d3d_device),
+                                None,
+                                Some(&mut d3d_device_context),
+                            )?;
+                        }
                         let d3d_device = d3d_device.ok_or(Unsupported::Direct3D)?;
                         let d3d_device_context = d3d_device_context.ok_or(Unsupported::Direct3D)?;
                         let device = winrt_device(&d3d_device)?;
@@ -313,8 +565,26 @@ impl VideoConfig {
                             3,
                             item_size,
                         )?;
+                        let state = Arc::new(Mutex::new(Some(FrameState {
+                            tx,
+                            gate: FpsGate::new(fps),
+                            d3d_device,
+                            d3d_device_context,
+                            staging: None,
+                            pool_size: item_size,
+                            size,
+                        })));
+                        let mut teardown = CaptureTeardown {
+                            session: None,
+                            pool,
+                            item,
+                            state: state.clone(),
+                            frame_token: None,
+                            closed_token: None,
+                            terminate: terminate.clone(),
+                        };
 
-                        let session = pool.CreateCaptureSession(&item)?;
+                        let session = teardown.pool.CreateCaptureSession(&teardown.item)?;
                         if let Some(fps) = fps.filter(|fps| *fps > 0)
                             && ApiInformation::IsPropertyPresent(
                                 &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
@@ -325,245 +595,95 @@ impl VideoConfig {
                                 Duration: 10_000_000 / fps as i64,
                             })?;
                         }
-                        let terminate_c = terminate.clone();
-                        let gate = Mutex::new(FpsGate::new(fps));
-                        let staging: Mutex<Option<(ID3D11Texture2D, u32, u32)>> = Mutex::new(None);
-                        let pool_size = Mutex::new(item_size);
-                        let copy_device = d3d_device.clone();
-                        // Copy one frame out, cropped to `content`.
-                        let copy_frame =
-                            move |frame: &Direct3D11CaptureFrame,
-                                  content: SizeInt32|
-                                  -> windows::core::Result<()> {
-                                // Only ContentSize pixels are defined, including on the
-                                // resize frame still backed by the old pool texture.
-                                if content.Width <= 0 || content.Height <= 0 {
-                                    return Ok(());
-                                }
-                                let ts = frame
-                                    .SystemRelativeTime()
-                                    .ok()
-                                    .and_then(|t| u64::try_from(t.Duration).ok())
-                                    .map_or_else(qpc_now, |t| t * 100);
-                                // A full channel would drop the frame anyway; skip the readback.
-                                if tx.is_full() || !gate.lock().allow(ts) {
-                                    return Ok(());
-                                }
-                                let surface = frame.Surface()?;
-                                let interface = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
-                                let texture = interface.GetInterface::<ID3D11Texture2D>()?;
-                                let mut desc = D3D11_TEXTURE2D_DESC::default();
-                                texture.GetDesc(&mut desc);
-                                // This frame was allocated at the pool's *old* size, and only
-                                // the top-left `ContentSize` of it is defined, so a source that
-                                // has shrunk is cropped rather than copied whole. Recreating
-                                // the pool only fixes the frames after this one.
-                                let width = desc.Width.min(content.Width as u32);
-                                let height = desc.Height.min(content.Height as u32);
+                        teardown.session = Some(session);
 
-                                let mut staging = staging.lock();
-                                let cpu_texture = match staging.as_ref() {
-                                    Some((texture, w, h)) if *w == width && *h == height => {
-                                        texture.clone()
+                        let terminate_frame = terminate.clone();
+                        let wake_frame = wake_tx.clone();
+                        let state_frame = state;
+                        teardown.frame_token =
+                            Some(teardown.pool.FrameArrived(&TypedEventHandler::<
+                                Direct3D11CaptureFramePool,
+                                IInspectable,
+                            >::new(
+                                move |pool, _| {
+                                    let mut guard = state_frame.lock();
+                                    if terminate_frame.load(Ordering::Acquire) {
+                                        return Ok(());
                                     }
-                                    _ => {
-                                        let cpu_desc = D3D11_TEXTURE2D_DESC {
-                                            Width: width,
-                                            Height: height,
-                                            Usage: D3D11_USAGE_STAGING,
-                                            BindFlags: 0,
-                                            CPUAccessFlags: (D3D11_CPU_ACCESS_READ
-                                                | D3D11_CPU_ACCESS_WRITE)
-                                                .0
-                                                as u32,
-                                            MiscFlags: 0,
-                                            ..desc
-                                        };
-                                        let mut cpu_texture = None;
-                                        copy_device.CreateTexture2D(
-                                            &cpu_desc,
-                                            None,
-                                            Some(&mut cpu_texture),
-                                        )?;
-                                        let cpu_texture = cpu_texture.ok_or_else(|| {
-                                            windows::core::Error::from_hresult(
-                                                windows::Win32::Foundation::E_FAIL,
-                                            )
-                                        })?;
-                                        *staging = Some((cpu_texture.clone(), width, height));
-                                        *size.lock() = (width, height);
-                                        cpu_texture
+                                    let Some(state) = guard.as_mut() else {
+                                        return Ok(());
+                                    };
+                                    let Some(pool) = pool.as_ref() else {
+                                        return Ok(());
+                                    };
+                                    // Logged rather than handed back to WinRT, which discards it
+                                    // silently: a persistent failure here -- a lost D3D11 device,
+                                    // say -- otherwise just stops frames arriving, with nothing in
+                                    // the log and the channel still open, so a consumer waits in
+                                    // `recv` with no way to tell why.
+                                    if let Err(e) = state.on_frame(pool) {
+                                        error!("capture frame failed: {e}");
+                                        // A device that was removed, reset or hung never comes back
+                                        // for this capture, so end it: every later frame would fail
+                                        // the same way, leaving a consumer in `recv` with no sign
+                                        // that the frames have stopped for good.
+                                        if is_device_lost(&e) {
+                                            terminate_frame.store(true, Ordering::Release);
+                                            let _ = wake_frame.try_send(());
+                                        }
                                     }
-                                };
-                                d3d_device_context.CopySubresourceRegion(
-                                    &cpu_texture,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    &texture,
-                                    0,
-                                    Some(&D3D11_BOX {
-                                        left: 0,
-                                        top: 0,
-                                        front: 0,
-                                        right: width,
-                                        bottom: height,
-                                        back: 1,
-                                    }),
-                                );
-
-                                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                                d3d_device_context.Map(
-                                    &cpu_texture,
-                                    0,
-                                    D3D11_MAP_READ,
-                                    0,
-                                    Some(&mut mapped),
-                                )?;
-                                let row_bytes = width as usize * 4;
-                                let pitch = mapped.RowPitch as usize;
-                                let rows = height as usize;
-                                let vframe =
-                                    pack_rows(mapped.pData as *const u8, pitch, row_bytes, rows);
-                                d3d_device_context.Unmap(&cpu_texture, 0);
-                                drop(staging);
-                                let Some(vframe) = vframe else {
-                                    return Ok(());
-                                };
-                                let _ = tx.try_send(VideoFrame {
-                                    vframe,
-                                    size: (width, height),
-                                    pix_fmt: PixFmt::Bgra,
-                                    ts,
-                                });
-                                Ok(())
-                            };
-                        let on_frame =
-                            move |pool: &Direct3D11CaptureFramePool| -> windows::core::Result<()> {
-                                let frame = pool.TryGetNextFrame()?;
-                                // The pool keeps handing out textures of the size it was
-                                // made with, clipping or padding a source that has since
-                                // resized, so a change means recreating it -- but not
-                                // before this frame, which belongs to the generation being
-                                // replaced, has gone back to the pool. The copy's outcome
-                                // is carried past that, so a resize is followed up
-                                // whichever way the copy went, including the early return
-                                // on a full channel.
-                                let content = frame.ContentSize()?;
-                                let copied = copy_frame(&frame, content);
-                                let _ = frame.Close();
-                                drop(frame);
-                                let mut pool_size = pool_size.lock();
-                                if content.Width > 0 && content.Height > 0 && content != *pool_size
-                                {
-                                    pool.Recreate(
-                                        &winrt_device(&d3d_device)?,
-                                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                                        3,
-                                        content,
-                                    )?;
-                                    *pool_size = content;
-                                }
-                                drop(pool_size);
-                                copied
-                            };
-                        let pump = GetCurrentThreadId();
-                        let token = pool.FrameArrived(&TypedEventHandler::<
-                            Direct3D11CaptureFramePool,
-                            IInspectable,
-                        >::new(
-                            move |pool, _| {
-                                if terminate_c.load(Ordering::Relaxed) {
-                                    return Ok(());
-                                }
-                                let Some(pool) = pool.as_ref() else {
-                                    return Ok(());
-                                };
-                                // Logged rather than handed back to WinRT, which discards it
-                                // silently: a persistent failure here -- a lost D3D11 device,
-                                // say -- otherwise just stops frames arriving, with nothing in
-                                // the log and the channel still open, so a consumer waits in
-                                // `recv` with no way to tell why.
-                                if let Err(e) = on_frame(pool) {
-                                    error!("capture frame failed: {e}");
-                                    // A device that was removed, reset or hung never comes back
-                                    // for this capture, so end it: every later frame would fail
-                                    // the same way, leaving a consumer in `recv` with no sign
-                                    // that the frames have stopped for good.
-                                    if [
-                                        DXGI_ERROR_DEVICE_REMOVED,
-                                        DXGI_ERROR_DEVICE_RESET,
-                                        DXGI_ERROR_DEVICE_HUNG,
-                                    ]
-                                    .contains(&e.code())
-                                    {
-                                        terminate_c.store(true, Ordering::Relaxed);
-                                        let _ = PostThreadMessageW(
-                                            pump,
-                                            WM_NULL,
-                                            Default::default(),
-                                            Default::default(),
-                                        );
-                                    }
-                                }
-                                Ok(())
-                            },
-                        ))?;
-                        let terminate_closed = terminate.clone();
-                        item.Closed(
-                            &TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(
-                                move |_, _| {
-                                    terminate_closed.store(true, Ordering::Relaxed);
-                                    let _ = PostThreadMessageW(
-                                        pump,
-                                        WM_NULL,
-                                        Default::default(),
-                                        LPARAM(0),
-                                    );
                                     Ok(())
                                 },
-                            ),
-                        )?;
-                        session.StartCapture()?;
-                        Ok((pool, session, token))
+                            ))?);
+
+                        let terminate_closed = terminate.clone();
+                        let wake_closed = wake_tx;
+                        teardown.closed_token =
+                            Some(teardown.item.Closed(&TypedEventHandler::<
+                                GraphicsCaptureItem,
+                                IInspectable,
+                            >::new(
+                                move |_, _| {
+                                    terminate_closed.store(true, Ordering::Release);
+                                    let _ = wake_closed.try_send(());
+                                    Ok(())
+                                },
+                            ))?);
+
+                        if let Some(session) = teardown.session.as_ref() {
+                            session.StartCapture()?;
+                        }
+                        Ok(teardown)
                     })();
 
-                let mut message = MSG::default();
-                let (pool, session, token) = match setup {
-                    Ok(v) => {
-                        let _ = PeekMessageW(&mut message, None, WM_USER, WM_USER, PM_NOREMOVE);
-                        let id = GetCurrentThreadId();
-                        let _ = setup_tx.send(Ok(id));
-                        v
-                    }
-                    Err(e) => {
-                        let _ = setup_tx.send(Err(e));
-                        return;
-                    }
-                };
+                    let _teardown = match setup {
+                        Ok(teardown) => {
+                            let _ = setup_tx.send(Ok(()));
+                            teardown
+                        }
+                        Err(e) => {
+                            let _ = setup_tx.send(Err(e));
+                            return;
+                        }
+                    };
 
-                loop {
-                    if terminate.load(Ordering::Relaxed) {
-                        break;
+                    while !terminate.load(Ordering::Acquire) {
+                        if wake_rx.recv().is_err() {
+                            break;
+                        }
                     }
-                    let ret = GetMessageW(&mut message, None, 0, 0);
-                    if ret.0 == -1 || !ret.as_bool() {
-                        break;
-                    }
-                    if terminate.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    DispatchMessageW(&message);
                 }
-                let _ = pool.RemoveFrameArrived(token);
-                let _ = session.Close();
+            }) {
+            Ok(jh) => jh,
+            Err(e) => {
+                restore_hidden(&hidden);
+                return Err(e.into());
             }
-        });
+        };
         drop(setup_tx);
 
-        let thread_id = match setup_rx.recv() {
-            Ok(Ok(id)) => id,
+        match setup_rx.recv() {
+            Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 let _ = jh.join();
                 restore_hidden(&hidden);
@@ -574,12 +694,12 @@ impl VideoConfig {
                 restore_hidden(&hidden);
                 return Err(CaptureError::WorkerGone);
             }
-        };
+        }
 
         Ok(CaptureVideoDesc {
             size,
             jh: Some(jh),
-            thread_id,
+            wake_tx,
             hidden,
             terminate: desc_terminate,
         })
@@ -636,6 +756,22 @@ unsafe fn wasapi_sample_fmt(format: *const WAVEFORMATEX) -> Option<SampleFmt> {
     }
 }
 
+fn is_device_invalidated(err: &CaptureError) -> bool {
+    matches!(err, CaptureError::Win(e) if e.code() == AUDCLNT_E_DEVICE_INVALIDATED)
+}
+
+fn is_transient_audio_error(err: &CaptureError) -> bool {
+    const E_NOTFOUND: HRESULT = HRESULT::from_win32(ERROR_NOT_FOUND.0);
+    matches!(
+        err,
+        CaptureError::Win(e)
+            if e.code() == E_NOTFOUND
+                || e.code() == AUDCLNT_E_DEVICE_INVALIDATED
+                || e.code() == AUDCLNT_E_ENDPOINT_CREATE_FAILED
+                || e.code() == AUDCLNT_E_SERVICE_NOT_RUNNING
+    )
+}
+
 /// This thread's COM apartment, left on drop.
 struct ComApartment;
 
@@ -652,38 +788,64 @@ impl Drop for ComApartment {
     }
 }
 
+/// Raw `IAudioCaptureClient::GetBuffer` preserving the exact `HRESULT`.
+///
+/// The high-level wrapper maps any success `HRESULT` (including `AUDCLNT_S_BUFFER_EMPTY`) to
+/// `Ok(())`, hiding whether a packet was actually acquired; calling `ReleaseBuffer(0)` after
+/// `AUDCLNT_S_BUFFER_EMPTY` fails with `AUDCLNT_E_OUT_OF_ORDER`.
+unsafe fn get_buffer_raw(
+    capture_client: &IAudioCaptureClient,
+    data: &mut *mut u8,
+    nb_frames: &mut u32,
+    flags: &mut u32,
+    qpc: &mut u64,
+) -> HRESULT {
+    unsafe {
+        (Interface::vtable(capture_client).GetBuffer)(
+            Interface::as_raw(capture_client),
+            data,
+            nb_frames,
+            flags,
+            core::ptr::null_mut(),
+            qpc,
+        )
+    }
+}
+
 /// A started WASAPI loopback capture of the default render device.
+///
+/// Must be dropped while the [`ComApartment`] passed to [`Loopback::start`] is still live.
 struct Loopback {
     audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
     sample_rate: i32,
     nb_channels: i32,
     sample_fmt: SampleFmt,
-    /// One sample of every channel.
+    /// One sample of every channel (`nBlockAlign`).
     frame_bytes: usize,
     buffer_frames: u32,
     /// The endpoint's default period in nanoseconds: loopback hands packets over one period
     /// after the QPC time they are stamped with.
     device_period: u64,
-    // Must stay last: fields drop in order, and the interfaces above have to be released
-    // while their apartment still exists.
-    _com: ComApartment,
 }
 
 impl Loopback {
-    fn start() -> Result<Self> {
-        let com = ComApartment::enter()?;
+    fn start(_com: &ComApartment) -> Result<Self> {
         unsafe {
             let device_enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator as *const _, None, CLSCTX_ALL)?;
             let device = device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
             let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
             let format = audio_client.GetMixFormat()?;
+            if format.is_null() {
+                return Err(Unsupported::SampleFormat.into());
+            }
             let sample_fmt = wasapi_sample_fmt(format);
-            let (sample_rate, nb_channels, bits_per_sample) = (
-                (*format).nSamplesPerSec as i32,
+            let (sample_rate, nb_channels, bits_per_sample, frame_bytes) = (
+                i32::try_from((*format).nSamplesPerSec).unwrap_or(0),
                 (*format).nChannels as i32,
                 (*format).wBitsPerSample as usize,
+                (*format).nBlockAlign as usize,
             );
             let init = audio_client.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -696,9 +858,14 @@ impl Loopback {
             CoTaskMemFree(Some(format as *const _));
             init?;
             let sample_fmt = sample_fmt.ok_or(Unsupported::SampleFormat)?;
-            // Both are divisors in the poll and timeline maths below, so a mix format that
-            // reports zero for either is one this backend cannot take, not a panic.
-            if sample_rate <= 0 || nb_channels <= 0 {
+            let expected_frame_bytes = (nb_channels as usize).checked_mul(bits_per_sample / 8);
+            // Both `sample_rate` and `nb_channels` are divisors in the poll and timeline maths
+            // below, and `nBlockAlign` is the authoritative byte size of one frame.
+            if sample_rate <= 0
+                || nb_channels <= 0
+                || frame_bytes == 0
+                || expected_frame_bytes != Some(frame_bytes)
+            {
                 return Err(Unsupported::SampleFormat.into());
             }
             let buffer_frames = audio_client.GetBufferSize()?;
@@ -712,14 +879,14 @@ impl Loopback {
                 sample_rate,
                 nb_channels,
                 sample_fmt,
-                frame_bytes: nb_channels as usize * (bits_per_sample / 8),
+                frame_bytes,
                 buffer_frames,
                 // 100 ns units; 10 ms is the shared-mode default if the driver reports none.
                 device_period: u64::try_from(device_period)
                     .ok()
-                    .filter(|period| *period > 0)
-                    .map_or(10_000_000, |period| period * 100),
-                _com: com,
+                    .filter(|&period| period > 0)
+                    .and_then(|period| period.checked_mul(100))
+                    .unwrap_or(10_000_000),
             })
         }
     }
@@ -730,11 +897,13 @@ impl Loopback {
         tx: &Sender<AudioFrame>,
         wake_rx: &Receiver<()>,
         terminate: &AtomicBool,
+        line: &mut Timeline,
     ) -> Result<()> {
         let poll = Duration::from_nanos(
-            1_000_000_000 * self.buffer_frames as u64 / self.sample_rate as u64 / 2,
+            (1_000_000_000u128 * self.buffer_frames as u128 / self.sample_rate as u128 / 2)
+                .min(10_000_000) as u64,
         )
-        .min(Duration::from_millis(10));
+        .max(Duration::from_millis(1));
         // U8 PCM is offset binary: its zero point is 128, not 0.
         let silence = match self.sample_fmt {
             SampleFmt::U8 => 128u8,
@@ -744,46 +913,37 @@ impl Loopback {
         // stamped with, so an empty poll proves nothing about the most recent periods. Filling
         // silence right up to now would cover time the next real packet is stamped in, and
         // that packet would then have to be pushed later than it was captured.
-        let settled = 3 * self.device_period;
-        let mut data: *mut u8 = core::ptr::null_mut();
-        let mut nb_frames = 0u32;
-        let mut flags = 0u32;
-        let mut qpc = 0u64;
-        let mut line = Timeline {
-            next: qpc_now(),
-            // Nothing has been emitted, so nothing before `next` is a real sample either.
-            invented: true,
-        };
-        while !terminate.load(Ordering::Relaxed) {
+        let settled = self.device_period.saturating_mul(3);
+        while !terminate.load(Ordering::Acquire) {
             match wake_rx.recv_timeout(poll) {
                 Err(RecvTimeoutError::Timeout) => {}
                 _ => break,
             }
             let mut delivered = false;
             while unsafe { self.capture_client.GetNextPacketSize()? } != 0 {
-                unsafe {
-                    self.capture_client.GetBuffer(
-                        &mut data as *mut _,
-                        &mut nb_frames as *mut _,
-                        &mut flags as *mut _,
-                        None,
-                        Some(&mut qpc),
-                    )?;
-                }
-                // WASAPI can report an empty packet without supplying a data pointer.
-                if nb_frames == 0 {
+                let mut data: *mut u8 = core::ptr::null_mut();
+                let mut nb_frames = 0u32;
+                let mut flags = 0u32;
+                let mut qpc = 0u64;
+                let hr = unsafe {
+                    get_buffer_raw(
+                        &self.capture_client,
+                        &mut data,
+                        &mut nb_frames,
+                        &mut flags,
+                        &mut qpc,
+                    )
+                };
+                if hr == AUDCLNT_S_BUFFER_EMPTY {
                     break;
                 }
-                let packet_bytes = nb_frames as usize * self.frame_bytes;
-                let mut aframe = Vec::with_capacity(packet_bytes);
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
-                    aframe.extend_from_slice(unsafe {
-                        core::slice::from_raw_parts(data, packet_bytes)
-                    });
-                } else {
-                    aframe.resize(packet_bytes, silence);
+                hr.ok()?;
+                // Only release when `S_OK` genuinely acquired a zero-frame packet;
+                // `AUDCLNT_S_BUFFER_EMPTY` above acquired nothing and must not call `ReleaseBuffer`.
+                if nb_frames == 0 {
+                    unsafe { self.capture_client.ReleaseBuffer(0)? };
+                    break;
                 }
-                unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
                 // One frame per packet, each with its own capture time: two packets drained
                 // in the same poll may be a pause apart, and merging them would place the
                 // second one early. `TIMESTAMP_ERROR` means the position is not usable, and
@@ -792,7 +952,36 @@ impl Loopback {
                 let ts = qpc.checked_mul(100).filter(|&ts| {
                     ts != 0 && flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0
                 });
-                self.emit(tx, terminate, &mut line, aframe, nb_frames, ts, false);
+                let Some(packet_bytes) = (nb_frames as usize)
+                    .checked_mul(self.frame_bytes)
+                    .filter(|&bytes| bytes <= isize::MAX as usize)
+                else {
+                    unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
+                    continue;
+                };
+                if i32::try_from(nb_frames).is_err() {
+                    unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
+                    continue;
+                }
+                if tx.is_full() {
+                    unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
+                    let _ = self.advance_timeline(line, nb_frames, ts, false);
+                    delivered = true;
+                    continue;
+                }
+                let is_silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+                let aframe = if !is_silent && !data.is_null() {
+                    let mut aframe = Vec::with_capacity(packet_bytes);
+                    aframe.extend_from_slice(unsafe {
+                        core::slice::from_raw_parts(data, packet_bytes)
+                    });
+                    unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
+                    aframe
+                } else {
+                    unsafe { self.capture_client.ReleaseBuffer(nb_frames)? };
+                    vec![silence; packet_bytes]
+                };
+                self.emit(tx, terminate, line, aframe, nb_frames, ts, false);
                 delivered = true;
             }
             if delivered {
@@ -805,8 +994,18 @@ impl Loopback {
             if nb_samples == 0 {
                 continue;
             }
-            let aframe = vec![silence; nb_samples as usize * self.frame_bytes];
-            self.emit(tx, terminate, &mut line, aframe, nb_samples, None, true);
+            if tx.is_full() {
+                let _ = self.advance_timeline(line, nb_samples, None, true);
+                continue;
+            }
+            let Some(silence_bytes) = (nb_samples as usize)
+                .checked_mul(self.frame_bytes)
+                .filter(|&bytes| bytes <= isize::MAX as usize)
+            else {
+                continue;
+            };
+            let aframe = vec![silence; silence_bytes];
+            self.emit(tx, terminate, line, aframe, nb_samples, None, true);
         }
         Ok(())
     }
@@ -821,6 +1020,46 @@ struct Timeline {
 }
 
 impl Loopback {
+    /// Advance `line` for a packet of `nb_samples` starting at `ts` (or `line.next`).
+    ///
+    /// Returns `Some((emitted_ts, remaining_samples, trimmed_leading_samples))`, or `None` if
+    /// the whole packet falls inside already-emitted silence.
+    fn advance_timeline(
+        &self,
+        line: &mut Timeline,
+        nb_samples: u32,
+        ts: Option<u64>,
+        invented: bool,
+    ) -> Option<(u64, u32, usize)> {
+        let mut ts = ts.unwrap_or(line.next);
+        let mut trimmed = 0usize;
+        let mut remaining = nb_samples;
+        if ts < line.next {
+            if line.invented {
+                // The frame reaches back into time already sent as made-up silence, or into
+                // time before the capture started. That cannot be taken back, and stamping
+                // the frame late instead would make every contiguous frame after it late
+                // too, since each continues from the one before. Drop the overlap;
+                // interleaved samples trim from the front one sample of every channel at a
+                // time.
+                let overlap = ((line.next - ts) as u128 * self.sample_rate as u128 + 500_000_000)
+                    / 1_000_000_000;
+                if overlap >= remaining as u128 {
+                    return None;
+                }
+                trimmed = overlap as usize;
+                remaining -= overlap as u32;
+            }
+            // After real samples the overlap is only timestamp jitter: the stream is
+            // contiguous, so it continues exactly where the last frame ended.
+            ts = line.next;
+        }
+        line.invented = invented;
+        line.next = ts
+            .saturating_add((remaining as u128 * 1_000_000_000 / self.sample_rate as u128) as u64);
+        Some((ts, remaining, trimmed))
+    }
+
     /// Send one frame, keeping the emitted timeline continuous.
     ///
     /// `ts` is the frame's own capture time where there is a usable one; without it the
@@ -832,43 +1071,30 @@ impl Loopback {
         terminate: &AtomicBool,
         line: &mut Timeline,
         mut aframe: Vec<u8>,
-        mut nb_samples: u32,
+        nb_samples: u32,
         ts: Option<u64>,
         invented: bool,
     ) {
-        let mut ts = ts.unwrap_or(line.next);
-        if ts < line.next {
-            if line.invented {
-                // The frame reaches back into time already sent as made-up silence, or into
-                // time before the capture started. That cannot be taken back, and stamping
-                // the frame late instead would make every contiguous frame after it late
-                // too, since each continues from the one before. Drop the overlap;
-                // interleaved samples trim from the front one sample of every channel at a
-                // time.
-                let overlap = ((line.next - ts) as u128 * self.sample_rate as u128 + 500_000_000)
-                    / 1_000_000_000;
-                if overlap >= nb_samples as u128 {
-                    return;
-                }
-                aframe.drain(..overlap as usize * self.frame_bytes);
-                nb_samples -= overlap as u32;
-            }
-            // After real samples the overlap is only timestamp jitter: the stream is
-            // contiguous, so it continues exactly where the last frame ended.
-            ts = line.next;
+        let Some((ts, remaining, trimmed)) = self.advance_timeline(line, nb_samples, ts, invented)
+        else {
+            return;
+        };
+        let Ok(nb_samples) = i32::try_from(remaining) else {
+            return;
+        };
+        if trimmed > 0 {
+            aframe.drain(..trimmed * self.frame_bytes);
         }
-        line.invented = invented;
-        line.next = ts + (nb_samples as u128 * 1_000_000_000 / self.sample_rate as u128) as u64;
         match tx.try_send(AudioFrame {
             aframe,
-            nb_samples: nb_samples as i32,
+            nb_samples,
             sample_rate: self.sample_rate,
             nb_channels: self.nb_channels,
             sample_fmt: self.sample_fmt,
             ts,
         }) {
             Ok(()) | Err(TrySendError::Full(_)) => {}
-            Err(TrySendError::Disconnected(_)) => terminate.store(true, Ordering::Relaxed),
+            Err(TrySendError::Disconnected(_)) => terminate.store(true, Ordering::Release),
         }
     }
 }
@@ -887,25 +1113,83 @@ impl AudioConfig {
     ) -> Result<CaptureAudioDesc> {
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let (setup_tx, setup_rx) = bounded::<Result<i32>>(1);
-        let jh = thread::spawn({
+        let sample_rate = Arc::new(AtomicI32::new(0));
+        let jh = thread::Builder::new().name("scrcap-audio".to_string()).spawn({
             let terminate = terminate.clone();
+            let sample_rate = sample_rate.clone();
             move || {
-                let loopback = match Loopback::start() {
+                let com = match ComApartment::enter() {
+                    Ok(com) => com,
+                    Err(e) => {
+                        let _ = setup_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let mut loopback = match Loopback::start(&com) {
                     Ok(loopback) => loopback,
                     Err(e) => {
                         let _ = setup_tx.send(Err(e));
                         return;
                     }
                 };
+                sample_rate.store(loopback.sample_rate, Ordering::Release);
                 let _ = setup_tx.send(Ok(loopback.sample_rate));
-                if let Err(e) = loopback.pump(&tx, &wake_rx, &terminate) {
-                    error!("audio capture stopped: {e}");
+
+                let mut line = Timeline {
+                    next: qpc_now(),
+                    // Nothing has been emitted, so nothing before `next` is a real sample either.
+                    invented: true,
+                };
+                'capture: loop {
+                    match loopback.pump(&tx, &wake_rx, &terminate, &mut line) {
+                        Ok(()) => break,
+                        Err(e) if is_device_invalidated(&e) => {
+                            drop(loopback);
+                            let mut backoff = Duration::from_millis(50);
+                            let mut logged = false;
+                            loop {
+                                if terminate.load(Ordering::Acquire) {
+                                    break 'capture;
+                                }
+                                match Loopback::start(&com) {
+                                    Ok(next) => {
+                                        sample_rate.store(next.sample_rate, Ordering::Release);
+                                        loopback = next;
+                                        continue 'capture;
+                                    }
+                                    Err(err) if is_transient_audio_error(&err) => {
+                                        if !logged {
+                                            warn!(
+                                                "audio device unavailable, waiting to reconnect: {err}"
+                                            );
+                                            logged = true;
+                                        }
+                                        match wake_rx.recv_timeout(backoff) {
+                                            Err(RecvTimeoutError::Timeout) => {
+                                                backoff =
+                                                    (backoff * 2).min(Duration::from_millis(500));
+                                            }
+                                            _ => break 'capture,
+                                        }
+                                    }
+                                    Err(err) => {
+                                        error!("audio capture stopped: {err}");
+                                        break 'capture;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("audio capture stopped: {e}");
+                            break;
+                        }
+                    }
                 }
             }
-        });
+        })?;
 
-        let sample_rate = match setup_rx.recv() {
-            Ok(Ok(sample_rate)) => sample_rate,
+        match setup_rx.recv() {
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 let _ = jh.join();
                 return Err(e);
@@ -914,7 +1198,7 @@ impl AudioConfig {
                 let _ = jh.join();
                 return Err(CaptureError::WorkerGone);
             }
-        };
+        }
         Ok(CaptureAudioDesc {
             sample_rate,
             jh: Some(jh),
@@ -940,7 +1224,7 @@ pub struct CaptureDesc {
 struct CaptureVideoDesc {
     size: Arc<Mutex<(u32, u32)>>,
     jh: Option<JoinHandle<()>>,
-    thread_id: u32,
+    wake_tx: Sender<()>,
     /// What this capture hid, each to be given back once.
     hidden: Vec<HideToken>,
     terminate: Arc<AtomicBool>,
@@ -952,15 +1236,13 @@ impl CaptureVideoDesc {
     }
 
     fn wake(&self) {
-        unsafe {
-            let _ = PostThreadMessageW(self.thread_id, WM_NULL, Default::default(), LPARAM(0));
-        }
+        let _ = self.wake_tx.try_send(());
     }
 }
 
 impl Drop for CaptureVideoDesc {
     fn drop(&mut self) {
-        self.terminate.store(true, Ordering::Relaxed);
+        self.terminate.store(true, Ordering::Release);
         self.wake();
         if let Some(jh) = self.jh.take() {
             let _ = jh.join();
@@ -971,7 +1253,7 @@ impl Drop for CaptureVideoDesc {
 
 #[derive(Debug)]
 struct CaptureAudioDesc {
-    sample_rate: i32,
+    sample_rate: Arc<AtomicI32>,
     jh: Option<JoinHandle<()>>,
     wake_tx: Sender<()>,
     terminate: Arc<AtomicBool>,
@@ -979,7 +1261,7 @@ struct CaptureAudioDesc {
 
 impl CaptureAudioDesc {
     pub fn sample_rate(&self) -> i32 {
-        self.sample_rate
+        self.sample_rate.load(Ordering::Acquire)
     }
 
     fn wake(&self) {
@@ -989,7 +1271,7 @@ impl CaptureAudioDesc {
 
 impl Drop for CaptureAudioDesc {
     fn drop(&mut self) {
-        self.terminate.store(true, Ordering::Relaxed);
+        self.terminate.store(true, Ordering::Release);
         self.wake();
         if let Some(jh) = self.jh.take() {
             let _ = jh.join();
@@ -1007,7 +1289,7 @@ impl TryFrom<CaptureConfig> for CaptureDesc {
 
 impl CaptureDescriptor for CaptureDesc {
     fn terminate(&self) {
-        self.terminate.store(true, Ordering::Relaxed);
+        self.terminate.store(true, Ordering::Release);
         self.video_desc.wake();
         if let Some(audio_desc) = self.audio_desc.as_ref() {
             audio_desc.wake();

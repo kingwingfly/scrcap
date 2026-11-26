@@ -3,7 +3,7 @@
 use crate::error::{CaptureError, Result};
 
 /// Configuration for the capture process.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CaptureConfig {
     /// The config for video
     pub video: VideoConfig,
@@ -27,7 +27,7 @@ impl CaptureConfig {
 }
 
 /// Configuration for the capture video.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VideoConfig {
     /// Capacity of the channel carrying video frames, at least 1.
     ///
@@ -67,7 +67,7 @@ pub struct VideoConfig {
 }
 
 /// Configuration for the capture audio.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AudioConfig {
     /// Capacity of the channel carrying audio frames, at least 1.
     ///
@@ -81,7 +81,12 @@ pub struct AudioConfig {
 pub enum Target {
     /// Capture the primary monitor.
     Primary,
-    /// Capture a specific monitor by its index.
+    /// Capture a specific monitor by its zero-based index.
+    ///
+    /// - Windows and macOS sort monitors deterministically: the primary monitor first,
+    ///   then by position `(x, y)` (with the platform display handle/id breaking ties).
+    /// - Linux ignores the index: the XDG portal picker always makes the final choice
+    ///   (restricted to monitors).
     Monitor(isize),
     /// Capture a specific window by its window id:
     /// - Windows: `HWND`

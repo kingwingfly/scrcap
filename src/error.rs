@@ -5,13 +5,14 @@ use thiserror::Error;
 /// Everything that can go wrong while setting up or running a capture.
 ///
 /// Variants are grouped by what a caller can *do* about them: [`Cancelled`] and
-/// [`PermissionDenied`] are user decisions, [`TargetNotFound`] and the `Invalid*` variants
-/// are wrong arguments, [`Unsupported`] is a missing capability, and the rest are failures
-/// reported by the platform.
+/// [`PermissionDenied`] are user decisions, [`TargetNotFound`], `BadWindowRegex`, and
+/// [`ZeroChannelCapacity`] are wrong arguments, [`Unsupported`] is a missing capability,
+/// and the rest are failures reported by the platform.
 ///
 /// [`Cancelled`]: Self::Cancelled
 /// [`PermissionDenied`]: Self::PermissionDenied
 /// [`TargetNotFound`]: Self::TargetNotFound
+/// [`ZeroChannelCapacity`]: Self::ZeroChannelCapacity
 /// [`Unsupported`]: Self::Unsupported
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -109,9 +110,15 @@ pub enum Unsupported {
     /// Direct3D 11 with BGRA support, which the Windows backend copies frames through.
     #[error("Direct3D 11")]
     Direct3D,
-    /// Hiding windows from the capture. No Wayland or X11 mechanism exists for it: the
-    /// portal's `SelectSources` takes no exclusion list, and X11 capture is an unmediated
-    /// read of the root window.
+    /// Hiding windows from the capture.
+    ///
+    /// - Linux: no Wayland or X11 mechanism exists for it — the portal's `SelectSources`
+    ///   takes no exclusion list, and X11 capture is an unmediated read of the root window.
+    /// - macOS: with [`Target::Pick`], excluding windows from a display or application
+    ///   selection requires macOS 15.2 or newer, and a selection whose exclusions cannot be
+    ///   applied returns this error.
+    ///
+    /// [`Target::Pick`]: crate::config::Target::Pick
     #[error("hiding windows from the capture")]
     HideWindows,
     /// Capturing one window. On Linux the portal's own picker makes the final choice, so a

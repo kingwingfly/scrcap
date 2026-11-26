@@ -25,5 +25,7 @@ var s_diffuse: sampler;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_diffuse, s_diffuse, in.tex_coords);
+    // Force opaque alpha so Linux `PixFmt::Bgr0` frames (whose 4th byte is undefined) never
+    // render transparent.
+    return vec4<f32>(textureSample(t_diffuse, s_diffuse, in.tex_coords).rgb, 1.0);
 }

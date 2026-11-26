@@ -47,6 +47,10 @@ impl fmt::Debug for AtomicSize {
 /// only the caller knows the view is still alive -- hence this rather than a pointer in the
 /// config. `None` if the view is not in a window.
 ///
+/// AppKit views are main-thread-only, so calls from any other thread dispatch synchronously
+/// onto the main queue via `DispatchQueue::main().exec_sync`. Calling this while the main
+/// thread is blocked waiting on the calling thread will deadlock.
+///
 /// [`VideoConfig::hide`]: crate::config::VideoConfig::hide
 ///
 /// # Safety

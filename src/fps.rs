@@ -2,7 +2,7 @@
 #[derive(Debug)]
 pub(crate) struct FpsGate {
     interval: u64,
-    next: Option<u64>,
+    next: Option<u128>,
 }
 
 impl FpsGate {
@@ -20,21 +20,34 @@ impl FpsGate {
         if self.interval == 0 {
             return true;
         }
+        // Widen to `u128` so timestamps near `u64::MAX` neither overflow nor lose
+        // spacing precision by saturating.
+        let interval = self.interval as u128;
+        let ts = ts as u128;
         let Some(next) = self.next else {
-            self.next = Some(ts + self.interval);
+            self.next = Some(ts + interval);
             return true;
         };
+        // Re-anchor if the timestamp clock jumped backwards (for instance, a stream
+        // switching from a `CLOCK_MONOTONIC` fallback to stream-relative PTS). Two
+        // intervals of margin keeps high-rate monotonic sources admitted through the
+        // `interval / 4` slack (which can land as early as `next - 5/4 * interval`)
+        // from tripping a false re-anchor.
+        if ts < next.saturating_sub(interval * 2) {
+            self.next = Some(ts + interval);
+            return true;
+        }
         // Timestamps jitter around their nominal instants, so a source running at the cap
         // lands a little either side of `next`; without slack every early one is dropped.
         // `next` still advances by whole intervals, so the slack cannot raise the rate.
-        if ts + self.interval / 4 < next {
+        if ts + interval / 4 < next {
             return false;
         }
         // Whole intervals, not from `ts`: a 75 Hz source under a 60 cap would emit 37.5.
-        self.next = Some(if ts > next + self.interval {
-            ts + self.interval
+        self.next = Some(if ts > next + interval {
+            ts + interval
         } else {
-            next + self.interval
+            next + interval
         });
         true
     }
@@ -119,5 +132,79 @@ mod tests {
         // 60 slots in the second, plus the one straddling its end that the slack admits.
         assert!((60..=61).contains(&passed.len()), "{}", passed.len());
         assert!(passed.windows(2).all(|w| w[1] - w[0] >= SEC / 60 * 3 / 4));
+    }
+
+    #[test]
+    fn backward_timestamp_jump_reanchors() {
+        let mut gate = FpsGate::new(Some(60));
+        let interval = SEC / 60;
+        assert!(gate.allow(10 * SEC));
+        // Jump far backwards (e.g. CLOCK_MONOTONIC fallback -> stream-relative PTS).
+        assert!(gate.allow(1));
+        // Normal gating resumes from the re-anchored timestamp.
+        assert!(!gate.allow(1 + interval / 2));
+        assert!(gate.allow(1 + interval));
+
+        // Subsequent high-rate frames after a backward jump are still capped at 60 Hz.
+        let passed = (0..1200)
+            .map(|i| SEC + i * SEC / 120)
+            .filter(|&ts| gate.allow(ts))
+            .count();
+        assert_eq!(passed, 600);
+    }
+
+    #[test]
+    fn near_u64_max_does_not_overflow_or_stall() {
+        let mut gate = FpsGate::new(Some(60));
+        assert!(gate.allow(u64::MAX - 500));
+        // 500 ns later is far below one 60 Hz interval and must be dropped without overflow.
+        assert!(!gate.allow(u64::MAX));
+        // Backward jump away from near `u64::MAX` re-anchors cleanly.
+        assert!(gate.allow(u64::MAX - 10 * SEC));
+        assert!(gate.allow(u64::MAX));
+        assert!(gate.allow(1));
+
+        // 1 second of 120 Hz frames running right up to `u64::MAX` caps at 60 fps cleanly.
+        let mut gate = FpsGate::new(Some(60));
+        let start = u64::MAX - SEC;
+        let passed = (0..120)
+            .map(|i| start + i * SEC / 120)
+            .filter(|&ts| gate.allow(ts))
+            .count();
+        assert_eq!(passed, 60);
+    }
+
+    #[test]
+    fn high_rate_monotonic_does_not_trip_backward_reanchor() {
+        // High-rate sources can emit a frame admitted via the `interval / 4` slack followed
+        // immediately by another frame still before `next - interval`; it must not re-anchor.
+        for (rate, frames) in [(360u64, 3600u64), (1000, 10_000)] {
+            for jitter in [false, true] {
+                let mut gate = FpsGate::new(Some(60));
+                let passed: Vec<u64> = (0..frames)
+                    .map(|i| {
+                        let ts = SEC + i * SEC / rate;
+                        match jitter {
+                            true => ts.saturating_add_signed(JITTER[i as usize % JITTER.len()]),
+                            false => ts,
+                        }
+                    })
+                    .filter(|&ts| gate.allow(ts))
+                    .collect();
+                // 600 slots in 10 seconds, plus up to 1 straddling the end admitted by slack.
+                assert!(
+                    (600..=601).contains(&passed.len()),
+                    "{rate} Hz, jitter {jitter}: {}",
+                    passed.len()
+                );
+                let min_gap = SEC / 60 * 3 / 4 - if jitter { 1_000_000 } else { 0 };
+                assert!(
+                    passed
+                        .windows(2)
+                        .all(|w| w[1] >= w[0] && w[1] - w[0] >= min_gap),
+                    "{rate} Hz, jitter {jitter}: spacing violated"
+                );
+            }
+        }
     }
 }

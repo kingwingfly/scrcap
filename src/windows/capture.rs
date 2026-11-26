@@ -20,7 +20,9 @@ use windows::{
         SizeInt32,
     },
     Win32::{
-        Foundation::{ERROR_NOT_FOUND, FALSE, HMODULE, HWND, LPARAM, POINT, RECT, TRUE},
+        Foundation::{
+            ERROR_NOT_FOUND, FALSE, HMODULE, HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE, TRUE,
+        },
         Graphics::{
             Direct3D::{
                 self, D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -43,7 +45,8 @@ use windows::{
         Media::{
             Audio::{
                 AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR,
-                AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_ENDPOINT_CREATE_FAILED,
+                AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_E_DEVICE_INVALIDATED,
+                AUDCLNT_E_ENDPOINT_CREATE_FAILED, AUDCLNT_E_RESOURCES_INVALIDATED,
                 AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_S_BUFFER_EMPTY, AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient, IMMDevice,
                 IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX,
@@ -61,6 +64,7 @@ use windows::{
             WinRT::{
                 Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
                 Graphics::Capture::IGraphicsCaptureItemInterop,
+                RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize,
             },
         },
         UI::{
@@ -287,6 +291,18 @@ fn is_device_lost(err: &windows::core::Error) -> bool {
     )
 }
 
+/// Clamp a frame timestamp to `last_ts` before gating, advancing `last_ts` when admitted so
+/// fallback `qpc_now()` vs earlier queued capture timestamps can never emit backwards or
+/// trip `FpsGate`'s backward re-anchor.
+fn admit_video_ts(gate: &mut FpsGate, last_ts: &mut u64, raw_ts: u64) -> Option<u64> {
+    let ts = raw_ts.max(*last_ts);
+    if !gate.allow(ts) {
+        return None;
+    }
+    *last_ts = ts;
+    Some(ts)
+}
+
 /// State owned by the `FrameArrived` callback while the capture is live.
 ///
 /// Wrapped in `Arc<Mutex<Option<FrameState>>>` so teardown can take it under the lock,
@@ -295,6 +311,7 @@ fn is_device_lost(err: &windows::core::Error) -> bool {
 struct FrameState {
     tx: Sender<VideoFrame>,
     gate: FpsGate,
+    last_ts: u64,
     d3d_device: ID3D11Device,
     d3d_device_context: ID3D11DeviceContext,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
@@ -314,17 +331,20 @@ impl FrameState {
         if content.Width <= 0 || content.Height <= 0 {
             return Ok(());
         }
-        let ts = frame
+        // A full channel would drop the frame anyway; skip the readback.
+        if self.tx.is_full() {
+            return Ok(());
+        }
+        let raw_ts = frame
             .SystemRelativeTime()
             .ok()
             .and_then(|t| u64::try_from(t.Duration).ok())
             .filter(|&t| t > 0)
             .and_then(|t| t.checked_mul(100))
             .unwrap_or_else(qpc_now);
-        // A full channel would drop the frame anyway; skip the readback.
-        if self.tx.is_full() || !self.gate.allow(ts) {
+        let Some(ts) = admit_video_ts(&mut self.gate, &mut self.last_ts, raw_ts) else {
             return Ok(());
-        }
+        };
         let surface = frame.Surface()?;
         let interface = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
         let texture = unsafe { interface.GetInterface::<ID3D11Texture2D>()? };
@@ -488,6 +508,9 @@ impl VideoConfig {
         tx: Sender<VideoFrame>,
         terminate: Arc<AtomicBool>,
     ) -> Result<CaptureVideoDesc> {
+        // Ensure WinRT is initialized on uninitialized caller threads (such as a worker
+        // spawned for `Target::Pick`), while leaving an existing STA untouched.
+        let _winrt = WinRtApartment::enter()?;
         if !GraphicsCaptureSession::IsSupported()? {
             return Err(Unsupported::ScreenCapture.into());
         }
@@ -537,6 +560,15 @@ impl VideoConfig {
                 let setup_tx = setup_tx.clone();
                 let wake_tx = wake_tx.clone();
                 move || {
+                    // Declared first so every WinRT and D3D11 object (including `_teardown`)
+                    // drops before `RoUninitialize`.
+                    let _winrt = match WinRtApartment::enter() {
+                        Ok(winrt) => winrt,
+                        Err(e) => {
+                            let _ = setup_tx.send(Err(e));
+                            return;
+                        }
+                    };
                     let setup = (|| -> Result<CaptureTeardown> {
                         const FEATURE_FLAGS: [Direct3D::D3D_FEATURE_LEVEL; 2] =
                             [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
@@ -568,6 +600,7 @@ impl VideoConfig {
                         let state = Arc::new(Mutex::new(Some(FrameState {
                             tx,
                             gate: FpsGate::new(fps),
+                            last_ts: 0,
                             d3d_device,
                             d3d_device_context,
                             staging: None,
@@ -756,35 +789,69 @@ unsafe fn wasapi_sample_fmt(format: *const WAVEFORMATEX) -> Option<SampleFmt> {
     }
 }
 
-fn is_device_invalidated(err: &CaptureError) -> bool {
-    matches!(err, CaptureError::Win(e) if e.code() == AUDCLNT_E_DEVICE_INVALIDATED)
-}
-
-fn is_transient_audio_error(err: &CaptureError) -> bool {
+fn is_recoverable_audio_error(err: &CaptureError) -> bool {
     const E_NOTFOUND: HRESULT = HRESULT::from_win32(ERROR_NOT_FOUND.0);
     matches!(
         err,
         CaptureError::Win(e)
-            if e.code() == E_NOTFOUND
-                || e.code() == AUDCLNT_E_DEVICE_INVALIDATED
-                || e.code() == AUDCLNT_E_ENDPOINT_CREATE_FAILED
-                || e.code() == AUDCLNT_E_SERVICE_NOT_RUNNING
+            if matches!(
+                e.code(),
+                E_NOTFOUND
+                    | AUDCLNT_E_DEVICE_INVALIDATED
+                    | AUDCLNT_E_RESOURCES_INVALIDATED
+                    | AUDCLNT_E_SERVICE_NOT_RUNNING
+                    | AUDCLNT_E_DEVICE_IN_USE
+                    | AUDCLNT_E_ENDPOINT_CREATE_FAILED
+            )
     )
 }
 
-/// This thread's COM apartment, left on drop.
-struct ComApartment;
+/// This thread's WinRT multithreaded apartment, left on drop if entered by this guard.
+struct WinRtApartment {
+    entered: bool,
+}
+
+impl WinRtApartment {
+    fn enter() -> Result<Self> {
+        match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+            Ok(()) => Ok(Self { entered: true }),
+            // The thread is already initialized in an STA; WinRT is live, and we must not
+            // uninitialize an apartment we did not enter.
+            Err(e) if e.code() == RPC_E_CHANGED_MODE => Ok(Self { entered: false }),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for WinRtApartment {
+    fn drop(&mut self) {
+        if self.entered {
+            unsafe { RoUninitialize() };
+        }
+    }
+}
+
+/// This thread's COM multithreaded apartment, left on drop if entered by this guard.
+struct ComApartment {
+    entered: bool,
+}
 
 impl ComApartment {
     fn enter() -> Result<Self> {
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
-        Ok(Self)
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr == RPC_E_CHANGED_MODE {
+            return Ok(Self { entered: false });
+        }
+        hr.ok()?;
+        Ok(Self { entered: true })
     }
 }
 
 impl Drop for ComApartment {
     fn drop(&mut self) {
-        unsafe { CoUninitialize() };
+        if self.entered {
+            unsafe { CoUninitialize() };
+        }
     }
 }
 
@@ -823,17 +890,19 @@ impl<T> Drop for CoTaskMem<T> {
     }
 }
 
-fn device_id(device: &IMMDevice) -> Option<Vec<u16>> {
-    let raw = unsafe { device.GetId() }.ok()?;
+fn device_id(device: &IMMDevice) -> windows::core::Result<Vec<u16>> {
+    let raw = unsafe { device.GetId()? };
     let guard = CoTaskMem(raw.0);
     if guard.0.is_null() {
-        return None;
+        return Err(windows::core::Error::from_hresult(
+            AUDCLNT_E_DEVICE_INVALIDATED,
+        ));
     }
     // SAFETY: `IMMDevice::GetId` returns a NUL-terminated UTF-16 string allocated with
     // `CoTaskMemAlloc`, which stays live until `guard` drops.
     let id = unsafe { raw.as_wide() }.to_vec();
     drop(guard);
-    Some(id)
+    Ok(id)
 }
 
 /// How often `Loopback::pump` probes whether the default output device changed.
@@ -852,7 +921,7 @@ enum PumpStop {
 struct Loopback {
     audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
-    device_id: Option<Vec<u16>>,
+    device_id: Vec<u16>,
     sample_rate: i32,
     nb_channels: i32,
     sample_fmt: SampleFmt,
@@ -867,7 +936,7 @@ struct Loopback {
 impl Loopback {
     fn start(_com: &ComApartment, enumerator: &IMMDeviceEnumerator) -> Result<Self> {
         let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
-        let device_id = device_id(&device);
+        let device_id = device_id(&device)?;
         let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
         let format = CoTaskMem(unsafe { audio_client.GetMixFormat()? });
         if format.0.is_null() {
@@ -931,18 +1000,15 @@ impl Loopback {
     /// Returns `true` if Windows' default render console endpoint now has a different ID.
     ///
     /// Transient probe failures (e.g. `E_NOTFOUND`) are ignored so `pump` and
-    /// `AUDCLNT_E_DEVICE_INVALIDATED` handling decide whether to re-bind.
+    /// recoverable-error handling decide whether to re-bind.
     fn default_device_changed(&self, enumerator: &IMMDeviceEnumerator) -> bool {
-        let Some(active_id) = self.device_id.as_deref() else {
-            return false;
-        };
         let Ok(default) = (unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }) else {
             return false;
         };
-        let Some(default_id) = device_id(&default) else {
+        let Ok(default_id) = device_id(&default) else {
             return false;
         };
-        default_id.as_slice() != active_id
+        default_id != self.device_id
     }
 
     /// Deliver audio until `terminate` is set, the consumer hangs up, the default output device
@@ -1221,7 +1287,7 @@ impl AudioConfig {
                         match loopback.pump(&enumerator, &tx, &wake_rx, &terminate, &mut line) {
                             Ok(PumpStop::Stopped) => break,
                             Ok(PumpStop::Rebind) => {}
-                            Err(e) if is_device_invalidated(&e) => {}
+                            Err(e) if is_recoverable_audio_error(&e) => {}
                             Err(e) => {
                                 error!("audio capture stopped: {e}");
                                 break;
@@ -1238,9 +1304,16 @@ impl AudioConfig {
                                 Ok(next) => {
                                     sample_rate.store(next.sample_rate, Ordering::Release);
                                     loopback = next;
+                                    line = Timeline {
+                                        next: qpc_now().max(line.next),
+                                        // Nothing has been emitted from the new endpoint yet, so
+                                        // a first packet lacking a usable QPC timestamp starts
+                                        // now rather than before the outage.
+                                        invented: true,
+                                    };
                                     continue 'capture;
                                 }
-                                Err(err) if is_transient_audio_error(&err) => {
+                                Err(err) if is_recoverable_audio_error(&err) => {
                                     if !logged {
                                         warn!(
                                             "audio device unavailable, waiting to reconnect: {err}"
@@ -1394,5 +1467,75 @@ impl Drop for CaptureDesc {
         self.terminate();
         let _ = self.v_rx.take(); // drop the receivers to terminate the channels
         let _ = self.a_rx.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL};
+
+    use super::*;
+
+    const SEC: u64 = 1_000_000_000;
+
+    #[test]
+    fn video_timestamps_never_go_backwards_on_fallback_jitter() {
+        // Capped at 60 fps: a fallback timestamp followed by an earlier queued capture
+        // timestamp must be clamped and dropped rather than tripping FpsGate re-anchor.
+        let mut gate = FpsGate::new(Some(60));
+        let mut last_ts = 0;
+        assert_eq!(admit_video_ts(&mut gate, &mut last_ts, SEC), Some(SEC));
+        // More than two 60 Hz intervals earlier than `next` (~1.0167 s): previously this
+        // tripped `FpsGate`'s backward-jump re-anchor and emitted `0.950 s < start`.
+        assert_eq!(
+            admit_video_ts(&mut gate, &mut last_ts, SEC - 50_000_000),
+            None
+        );
+        assert_eq!(last_ts, SEC);
+        // Next real frame at the 60 Hz cadence is admitted monotonically.
+        let next = SEC + SEC / 60;
+        assert_eq!(admit_video_ts(&mut gate, &mut last_ts, next), Some(next));
+        assert_eq!(last_ts, next);
+
+        // Uncapped: earlier queued timestamp is clamped to `last_ts` so `ts - start`
+        // cannot underflow.
+        let mut gate = FpsGate::new(None);
+        let mut last_ts = 0;
+        assert_eq!(admit_video_ts(&mut gate, &mut last_ts, SEC), Some(SEC));
+        assert_eq!(
+            admit_video_ts(&mut gate, &mut last_ts, SEC - 50_000_000),
+            Some(SEC)
+        );
+        assert_eq!(last_ts, SEC);
+    }
+
+    #[test]
+    fn recoverable_audio_errors_are_classified_consistently() {
+        let recoverable = [
+            HRESULT::from_win32(ERROR_NOT_FOUND.0),
+            AUDCLNT_E_DEVICE_INVALIDATED,
+            AUDCLNT_E_RESOURCES_INVALIDATED,
+            AUDCLNT_E_SERVICE_NOT_RUNNING,
+            AUDCLNT_E_DEVICE_IN_USE,
+            AUDCLNT_E_ENDPOINT_CREATE_FAILED,
+        ];
+        for hr in recoverable {
+            let err = CaptureError::Win(windows::core::Error::from_hresult(hr));
+            assert!(
+                is_recoverable_audio_error(&err),
+                "expected {hr:?} to be recoverable"
+            );
+        }
+
+        for hr in [E_ACCESSDENIED, E_FAIL] {
+            let err = CaptureError::Win(windows::core::Error::from_hresult(hr));
+            assert!(
+                !is_recoverable_audio_error(&err),
+                "expected {hr:?} to be non-recoverable"
+            );
+        }
+        assert!(!is_recoverable_audio_error(&CaptureError::Unsupported(
+            Unsupported::SampleFormat
+        )));
     }
 }

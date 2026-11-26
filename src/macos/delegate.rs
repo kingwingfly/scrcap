@@ -1,13 +1,15 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicI32, Ordering},
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+    },
 };
 
 use crossbeam_channel::Sender;
 use crossbeam_utils::sync::Unparker;
 use objc2::{
-    AnyThread as _, DefinedClass as _, Message as _, define_class, msg_send, rc::Retained,
-    runtime::AnyObject,
+    AnyThread as _, DefinedClass as _, define_class, msg_send, rc::Retained, runtime::AnyObject,
 };
 use objc2_core_audio_types::{
     AudioBuffer, AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsBigEndian,
@@ -44,11 +46,34 @@ use crate::{
     util::{pack_rows, row_span},
 };
 
+/// Per-stream monotonic timestamp floor (in nanoseconds).
+///
+/// ScreenCaptureKit sample buffers can mix fallback `host_time_clock()` timestamps with
+/// slightly older queued capture `CMTime` PTS values; clamping to the last committed
+/// timestamp keeps each stream's published timestamps non-decreasing and prevents
+/// `FpsGate` from mistaking capture-vs-fallback jitter for a clock backward jump.
+#[derive(Debug, Default)]
+struct MonotonicFloor(AtomicU64);
+
+impl MonotonicFloor {
+    /// Raise `ts` to at least the last committed timestamp without advancing the floor.
+    fn clamp(&self, ts: u64) -> u64 {
+        ts.max(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Commit `ts` as the new floor if it is greater, returning the monotonic timestamp.
+    fn commit(&self, ts: u64) -> u64 {
+        self.0.fetch_max(ts, Ordering::Relaxed).max(ts)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamOutput {
     v_tx: Sender<VideoFrame>,
     a_tx: Option<Sender<AudioFrame>>,
     gate: Mutex<FpsGate>,
+    last_video_ts: MonotonicFloor,
+    last_audio_ts: MonotonicFloor,
     size: Arc<AtomicSize>,
     sample_rate: Option<Arc<AtomicI32>>,
 }
@@ -119,6 +144,7 @@ define_class!(
                             );
                             return;
                         };
+                        let ts = self.ivars().last_video_ts.clamp(ts);
                         if !self.ivars().gate.lock().allow(ts) {
                             CVPixelBufferUnlockBaseAddress(
                                 &buffer,
@@ -131,6 +157,7 @@ define_class!(
                         let Some(vframe) = vframe else {
                             return;
                         };
+                        let ts = self.ivars().last_video_ts.commit(ts);
                         self.ivars().size.store(w, h);
                         let _ = self.ivars().v_tx.try_send(VideoFrame {
                             vframe,
@@ -180,6 +207,7 @@ define_class!(
                         ) else {
                             return;
                         };
+                        let ts = self.ivars().last_audio_ts.commit(ts);
                         let _ = a_tx.try_send(AudioFrame {
                             aframe,
                             nb_samples,
@@ -378,11 +406,31 @@ impl VideoStreamOutput {
                 v_tx,
                 a_tx,
                 gate: Mutex::new(FpsGate::new(fps)),
+                last_video_ts: MonotonicFloor::default(),
+                last_audio_ts: MonotonicFloor::default(),
                 size,
                 sample_rate,
             });
             msg_send![super(this), init]
         }
+    }
+}
+
+/// Map an `SCStreamErrorDomain` code to a [`CaptureError`].
+///
+/// Only `UserDeclined` maps to [`CaptureError::PermissionDenied`]; signing/entitlement errors
+/// such as `MissingEntitlements` (`-3803`) are not user Screen Recording TCC decisions and
+/// stay as [`ScreenCaptureKitError::Stream`].
+fn sc_stream_error(code: isize) -> CaptureError {
+    match SCStreamErrorCode(code) {
+        SCStreamErrorCode::UserDeclined => CaptureError::PermissionDenied,
+        SCStreamErrorCode::UserStopped | SCStreamErrorCode::SystemStoppedStream => {
+            ScreenCaptureKitError::Stopped.into()
+        }
+        SCStreamErrorCode::FailedToStart | SCStreamErrorCode::FailedToStartAudioCapture => {
+            ScreenCaptureKitError::FailedToStart.into()
+        }
+        _ => ScreenCaptureKitError::Stream(code).into(),
     }
 }
 
@@ -395,18 +443,7 @@ pub(crate) fn ns_error(e: &NSError) -> CaptureError {
     if &*e.domain() != unsafe { SCStreamErrorDomain } {
         return ScreenCaptureKitError::Other(code).into();
     }
-    match SCStreamErrorCode(code) {
-        SCStreamErrorCode::UserDeclined | SCStreamErrorCode::MissingEntitlements => {
-            CaptureError::PermissionDenied
-        }
-        SCStreamErrorCode::UserStopped | SCStreamErrorCode::SystemStoppedStream => {
-            ScreenCaptureKitError::Stopped.into()
-        }
-        SCStreamErrorCode::FailedToStart | SCStreamErrorCode::FailedToStartAudioCapture => {
-            ScreenCaptureKitError::FailedToStart.into()
-        }
-        _ => ScreenCaptureKitError::Stream(code).into(),
-    }
+    sc_stream_error(code)
 }
 
 #[derive(Debug)]
@@ -457,9 +494,20 @@ impl StreamDelegate {
     }
 }
 
-#[derive(Debug)]
+type PickerCallback = Box<dyn FnOnce(Result<&SCContentFilter>) + Send>;
+
 pub(crate) struct PickerObserverIvars {
-    tx: Sender<Result<Retained<SCContentFilter>>>,
+    /// One-shot callback invoked synchronously inside the observer method so the picker-owned
+    /// `SCContentFilter` is consumed in place without ever sending it across threads.
+    on_result: Mutex<Option<PickerCallback>>,
+}
+
+impl fmt::Debug for PickerObserverIvars {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PickerObserverIvars")
+            .field("pending", &self.on_result.lock().is_some())
+            .finish()
+    }
 }
 
 define_class!(
@@ -479,8 +527,10 @@ define_class!(
             filter: &SCContentFilter,
             stream: Option<&SCStream>,
         ) {
-            if stream.is_none() {
-                let _ = self.ivars().tx.try_send(Ok(filter.retain()));
+            if stream.is_none()
+                && let Some(on_result) = self.ivars().on_result.lock().take()
+            {
+                on_result(Ok(filter));
             }
         }
 
@@ -490,22 +540,30 @@ define_class!(
             _picker: &SCContentSharingPicker,
             stream: Option<&SCStream>,
         ) {
-            if stream.is_none() {
-                let _ = self.ivars().tx.try_send(Err(CaptureError::Cancelled));
+            if stream.is_none()
+                && let Some(on_result) = self.ivars().on_result.lock().take()
+            {
+                on_result(Err(CaptureError::Cancelled));
             }
         }
 
         #[unsafe(method(contentSharingPickerStartDidFailWithError:))]
         unsafe fn contentSharingPickerStartDidFailWithError(&self, error: &NSError) {
-            let _ = self.ivars().tx.try_send(Err(ns_error(error)));
+            if let Some(on_result) = self.ivars().on_result.lock().take() {
+                on_result(Err(ns_error(error)));
+            }
         }
     }
 );
 
 impl PickerObserver {
-    pub(crate) fn new(tx: Sender<Result<Retained<SCContentFilter>>>) -> Retained<Self> {
+    pub(crate) fn new(
+        on_result: impl FnOnce(Result<&SCContentFilter>) + Send + 'static,
+    ) -> Retained<Self> {
         unsafe {
-            let this = Self::alloc().set_ivars(PickerObserverIvars { tx });
+            let this = Self::alloc().set_ivars(PickerObserverIvars {
+                on_result: Mutex::new(Some(Box::new(on_result))),
+            });
             msg_send![super(this), init]
         }
     }
@@ -592,5 +650,75 @@ mod tests {
             asbd_sample_fmt(&make(s16_native | kAudioFormatFlagIsBigEndian, 16)),
             None
         );
+    }
+
+    #[test]
+    fn monotonic_floor_clamps_backward_jitter_without_advancing_until_committed() {
+        let floor = MonotonicFloor::default();
+        assert_eq!(floor.clamp(0), 0);
+        assert_eq!(floor.clamp(1_000), 1_000);
+        // Uncommitted clamp does not move the floor.
+        assert_eq!(floor.clamp(500), 500);
+
+        assert_eq!(floor.commit(1_000_000_000), 1_000_000_000);
+        assert_eq!(floor.clamp(950_000_000), 1_000_000_000);
+        assert_eq!(floor.commit(950_000_000), 1_000_000_000);
+        assert_eq!(floor.clamp(1_016_666_666), 1_016_666_666);
+        // Still uncommitted, so an older timestamp clamps to the last committed floor.
+        assert_eq!(floor.clamp(1_005_000_000), 1_005_000_000);
+        assert_eq!(floor.commit(1_016_666_666), 1_016_666_666);
+        assert_eq!(floor.clamp(1_005_000_000), 1_016_666_666);
+        assert_eq!(floor.commit(u64::MAX), u64::MAX);
+        assert_eq!(floor.clamp(0), u64::MAX);
+    }
+
+    #[test]
+    fn monotonic_floor_prevents_fps_gate_backward_reanchor_and_underflow() {
+        // Fallback host clock at 1.000s followed by a queued capture PTS >2 frames earlier:
+        // clamping before `FpsGate` prevents backward re-anchoring and keeps timestamps monotonic.
+        let floor = MonotonicFloor::default();
+        let mut gate = FpsGate::new(Some(60));
+
+        let start = floor.clamp(1_000_000_000);
+        assert!(gate.allow(start));
+        let start = floor.commit(start);
+
+        let stale = floor.clamp(960_000_000);
+        assert_eq!(stale, start);
+        assert!(!gate.allow(stale));
+
+        // Even uncapped streams never emit a timestamp earlier than `start`.
+        let mut uncapped = FpsGate::new(None);
+        assert!(uncapped.allow(start));
+        assert!(uncapped.allow(stale));
+        assert_eq!(stale - start, 0);
+
+        // Normal forward progression resumes on the next interval.
+        let next = floor.clamp(1_017_000_000);
+        assert!(gate.allow(next));
+        let next = floor.commit(next);
+        assert_eq!(next, 1_017_000_000);
+        assert_eq!(next - start, 17_000_000);
+    }
+
+    #[test]
+    fn sc_stream_error_keeps_missing_entitlements_distinct_from_permission_denied() {
+        assert!(matches!(
+            sc_stream_error(SCStreamErrorCode::UserDeclined.0),
+            CaptureError::PermissionDenied
+        ));
+        assert!(matches!(
+            sc_stream_error(SCStreamErrorCode::MissingEntitlements.0),
+            CaptureError::ScreenCaptureKit(ScreenCaptureKitError::Stream(code))
+                if code == SCStreamErrorCode::MissingEntitlements.0
+        ));
+        assert!(matches!(
+            sc_stream_error(SCStreamErrorCode::UserStopped.0),
+            CaptureError::ScreenCaptureKit(ScreenCaptureKitError::Stopped)
+        ));
+        assert!(matches!(
+            sc_stream_error(SCStreamErrorCode::FailedToStart.0),
+            CaptureError::ScreenCaptureKit(ScreenCaptureKitError::FailedToStart)
+        ));
     }
 }

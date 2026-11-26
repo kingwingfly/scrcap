@@ -1,8 +1,18 @@
+/// Minimum backward timestamp jump (1 second) treated as a genuine clock reset
+/// rather than a stale or out-of-order frame.
+const BACKWARD_RESET_NS: u128 = 1_000_000_000;
+
+#[derive(Debug)]
+struct GateState {
+    last_ts: u128,
+    next: u128,
+}
+
 /// Drops frames that arrive faster than the cap, which no platform enforces reliably.
 #[derive(Debug)]
 pub(crate) struct FpsGate {
     interval: u64,
-    next: Option<u128>,
+    state: Option<GateState>,
 }
 
 impl FpsGate {
@@ -11,11 +21,18 @@ impl FpsGate {
             interval: fps
                 .filter(|fps| *fps > 0)
                 .map_or(0, |fps| 1_000_000_000 / fps as u64),
-            next: None,
+            state: None,
         }
     }
 
     /// Whether a frame captured at `ts` (nanoseconds) should be delivered.
+    ///
+    /// Callers should also pass monotonically non-decreasing per-stream timestamps
+    /// (e.g. clamped against a per-stream monotonic floor). When capped, stale or
+    /// out-of-order frames whose timestamp falls behind the last accepted frame by
+    /// less than `max(1 s, 2 * interval)` are dropped rather than re-anchored,
+    /// while a genuine large backward clock reset still re-anchors so delivery
+    /// recovers cleanly.
     pub(crate) fn allow(&mut self, ts: u64) -> bool {
         if self.interval == 0 {
             return true;
@@ -24,31 +41,40 @@ impl FpsGate {
         // spacing precision by saturating.
         let interval = self.interval as u128;
         let ts = ts as u128;
-        let Some(next) = self.next else {
-            self.next = Some(ts + interval);
+        let Some(state) = &mut self.state else {
+            self.state = Some(GateState {
+                last_ts: ts,
+                next: ts + interval,
+            });
             return true;
         };
-        // Re-anchor if the timestamp clock jumped backwards (for instance, a stream
-        // switching from a `CLOCK_MONOTONIC` fallback to stream-relative PTS). Two
-        // intervals of margin keeps high-rate monotonic sources admitted through the
-        // `interval / 4` slack (which can land as early as `next - 5/4 * interval`)
-        // from tripping a false re-anchor.
-        if ts < next.saturating_sub(interval * 2) {
-            self.next = Some(ts + interval);
-            return true;
+        if ts < state.last_ts {
+            // Re-anchor only if the timestamp clock jumped far backwards (for instance,
+            // a stream switching from a `CLOCK_MONOTONIC` fallback to stream-relative PTS).
+            // Smaller backward jumps (such as a queued frame arriving after a fallback
+            // sample, or slight out-of-order jitter) are dropped so already-emitted
+            // timestamps never go backwards.
+            let reset_threshold = BACKWARD_RESET_NS.max(interval * 2);
+            if state.last_ts - ts >= reset_threshold {
+                state.last_ts = ts;
+                state.next = ts + interval;
+                return true;
+            }
+            return false;
         }
         // Timestamps jitter around their nominal instants, so a source running at the cap
         // lands a little either side of `next`; without slack every early one is dropped.
         // `next` still advances by whole intervals, so the slack cannot raise the rate.
-        if ts + interval / 4 < next {
+        if ts + interval / 4 < state.next {
             return false;
         }
         // Whole intervals, not from `ts`: a 75 Hz source under a 60 cap would emit 37.5.
-        self.next = Some(if ts > next + interval {
+        state.last_ts = ts;
+        state.next = if ts > state.next + interval {
             ts + interval
         } else {
-            next + interval
-        });
+            state.next + interval
+        };
         true
     }
 }
@@ -135,11 +161,40 @@ mod tests {
     }
 
     #[test]
+    fn fallback_then_queued_frame_is_dropped_not_reanchored() {
+        let mut gate = FpsGate::new(Some(60));
+        let interval = SEC / 60;
+        // Fallback clock sample at 1.000 s.
+        assert!(gate.allow(SEC));
+        // Queued frame with earlier capture PTS (0.980 s, 20 ms behind) must be dropped,
+        // not treated as a clock reset.
+        assert!(!gate.allow(SEC - 20_000_000));
+        // Even larger stale pipeline latency below the 1 s reset threshold is dropped.
+        assert!(!gate.allow(SEC - 500_000_000));
+        // Gating cadence anchored at 1.000 s was untouched by the dropped frames.
+        assert!(!gate.allow(SEC + interval / 2));
+        assert!(gate.allow(SEC + interval));
+
+        // After a slightly late accepted frame (where `next - last_ts < interval / 4`),
+        // a small backward jump is still dropped even though `ts + interval / 4 >= next`.
+        let mut gate = FpsGate::new(Some(60));
+        assert!(gate.allow(SEC));
+        assert!(gate.allow(SEC + 30_000_000));
+        assert!(!gate.allow(SEC + 29_500_000));
+    }
+
+    #[test]
     fn backward_timestamp_jump_reanchors() {
         let mut gate = FpsGate::new(Some(60));
         let interval = SEC / 60;
         assert!(gate.allow(10 * SEC));
+        // Genuine large clock reset (10 s -> 1 s) re-anchors and recovers.
+        assert!(gate.allow(SEC));
+        assert!(!gate.allow(SEC + interval / 2));
+        assert!(gate.allow(SEC + interval));
+
         // Jump far backwards (e.g. CLOCK_MONOTONIC fallback -> stream-relative PTS).
+        assert!(gate.allow(10 * SEC));
         assert!(gate.allow(1));
         // Normal gating resumes from the re-anchored timestamp.
         assert!(!gate.allow(1 + interval / 2));
@@ -151,6 +206,12 @@ mod tests {
             .filter(|&ts| gate.allow(ts))
             .count();
         assert_eq!(passed, 600);
+
+        // Low frame-rate caps respect the `2 * interval` floor on the reset threshold.
+        let mut low_fps = FpsGate::new(Some(1));
+        assert!(low_fps.allow(10 * SEC));
+        assert!(!low_fps.allow(8 * SEC + 500_000_000));
+        assert!(low_fps.allow(SEC));
     }
 
     #[test]
@@ -159,19 +220,23 @@ mod tests {
         assert!(gate.allow(u64::MAX - 500));
         // 500 ns later is far below one 60 Hz interval and must be dropped without overflow.
         assert!(!gate.allow(u64::MAX));
-        // Backward jump away from near `u64::MAX` re-anchors cleanly.
+        // Small backward jump near `u64::MAX` is dropped without overflow or re-anchor.
+        assert!(!gate.allow(u64::MAX - 20_000_000));
+        // Genuine large backward jump away from near `u64::MAX` re-anchors cleanly.
         assert!(gate.allow(u64::MAX - 10 * SEC));
         assert!(gate.allow(u64::MAX));
         assert!(gate.allow(1));
 
-        // 1 second of 120 Hz frames running right up to `u64::MAX` caps at 60 fps cleanly.
+        // 1 second of 120 Hz monotonic frames running right up to `u64::MAX` caps at 60 fps
+        // without overflow or non-monotonic admissions.
         let mut gate = FpsGate::new(Some(60));
         let start = u64::MAX - SEC;
-        let passed = (0..120)
+        let passed: Vec<u64> = (0..120)
             .map(|i| start + i * SEC / 120)
             .filter(|&ts| gate.allow(ts))
-            .count();
-        assert_eq!(passed, 60);
+            .collect();
+        assert_eq!(passed.len(), 60);
+        assert!(passed.windows(2).all(|w| w[1] > w[0]));
     }
 
     #[test]

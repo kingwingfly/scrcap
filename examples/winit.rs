@@ -78,6 +78,8 @@ struct App {
     state: Option<State>,
     /// The capture being built on another thread.
     pending: Option<Receiver<scrcap::error::Result<CaptureDesc>>>,
+    /// Whether the preview window is currently occluded.
+    occluded: bool,
 }
 
 /// This window's own id, in the form [`VideoConfig::hide`] wants, so the preview does not
@@ -105,8 +107,11 @@ fn hide_self(window: &Window) -> Vec<isize> {
 
 /// Build the capture on another thread.
 ///
-/// `Target::Pick` blocks `create` until the user chooses, and on Windows and macOS the picker
-/// answers on this very thread, so `create` has to run somewhere else.
+/// `Target::Pick` blocks `create` until the user chooses: on Windows `create` waits on
+/// `PickSingleItemAsync().join()` without pumping the `HWND`'s message loop (so a non-UI,
+/// non-STA worker thread avoids deadlocking the UI thread, even though WinRT formally
+/// recommends calling `PickSingleItemAsync` non-blockingly on the UI thread), and on macOS
+/// the picker answers on the main queue.
 fn start_capture(window: &Window) -> Receiver<scrcap::error::Result<CaptureDesc>> {
     let hide = hide_self(window);
     #[cfg(target_os = "windows")]
@@ -141,6 +146,7 @@ impl ApplicationHandler for App {
             .create_window(Window::default_attributes().with_window_level(WindowLevel::AlwaysOnTop))
             .expect("Window should be created");
         let state = pollster::block_on(State::new(window)).expect("State should be initialized");
+        self.occluded = false;
         state.window.request_redraw();
         self.state = Some(state);
     }
@@ -151,7 +157,7 @@ impl ApplicationHandler for App {
         };
         match rx.try_recv() {
             Ok(Ok(capture_desc)) => {
-                state.attach(capture_desc);
+                state.attach(capture_desc, self.occluded);
                 self.pending = None;
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
@@ -181,8 +187,18 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.resize(size.width, size.height),
+            WindowEvent::Resized(size) => state.resize(size.width, size.height, self.occluded),
+            WindowEvent::Occluded(occluded) => {
+                let was_occluded = self.occluded;
+                self.occluded = occluded;
+                if !occluded && (was_occluded || !state.presented || state.capture_desc.is_some()) {
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
+                if self.occluded {
+                    return;
+                }
                 if !state.render() {
                     event_loop.exit();
                     return;
@@ -400,11 +416,13 @@ impl State {
     }
 
     /// Start showing a capture, sizing the texture to it.
-    fn attach(&mut self, capture_desc: CaptureDesc) {
+    fn attach(&mut self, capture_desc: CaptureDesc, occluded: bool) {
         let (width, height) = capture_desc.size();
         self.resize_texture(width, height);
         self.capture_desc = Some(capture_desc);
-        self.window.request_redraw();
+        if !occluded {
+            self.window.request_redraw();
+        }
     }
 
     fn resize_texture(&mut self, width: u32, height: u32) {
@@ -422,14 +440,16 @@ impl State {
             .bind_group(&self.device, &self.texture_bind_group_layout);
     }
 
-    fn resize(&mut self, width: u32, height: u32) {
+    fn resize(&mut self, width: u32, height: u32, occluded: bool) {
         info!("Resizing to {width}x{height}");
         self.is_surface_configured = width > 0 && height > 0;
         if self.is_surface_configured {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
-            self.window.request_redraw();
+            if !occluded {
+                self.window.request_redraw();
+            }
         }
     }
 
@@ -437,9 +457,6 @@ impl State {
     fn render(&mut self) -> bool {
         if !self.is_surface_configured {
             return true;
-        }
-        if self.capture_desc.is_some() {
-            self.window.request_redraw();
         }
 
         // `get_current_texture` no longer returns a `Result`; every outcome, including
@@ -450,11 +467,12 @@ impl State {
             CurrentSurfaceTexture::Suboptimal(output) => (output, true),
             // Nothing to draw into right now; try again on the next redraw.
             CurrentSurfaceTexture::Timeout => {
-                if !self.presented {
+                if !self.presented || self.capture_desc.is_some() {
                     self.window.request_redraw();
                 }
                 return true;
             }
+            // Wait for `WindowEvent::Occluded(false)` instead of spinning redraws.
             CurrentSurfaceTexture::Occluded => return true,
             CurrentSurfaceTexture::Lost => {
                 self.surface = match self.instance.create_surface(self.window.clone()) {
@@ -465,12 +483,12 @@ impl State {
                     }
                 };
                 let size = self.window.inner_size();
-                self.resize(size.width, size.height);
+                self.resize(size.width, size.height, false);
                 return true;
             }
             CurrentSurfaceTexture::Outdated => {
                 let size = self.window.inner_size();
-                self.resize(size.width, size.height);
+                self.resize(size.width, size.height, false);
                 return true;
             }
             CurrentSurfaceTexture::Validation => {
@@ -530,7 +548,9 @@ impl State {
         if suboptimal {
             warn!("Surface suboptimal, reconfiguring...");
             let size = self.window.inner_size();
-            self.resize(size.width, size.height);
+            self.resize(size.width, size.height, false);
+        } else if self.capture_desc.is_some() {
+            self.window.request_redraw();
         }
         true
     }

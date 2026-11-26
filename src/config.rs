@@ -52,8 +52,8 @@ pub struct VideoConfig {
     ///   `Monitor` only restrict it to monitors (the index is *not* honoured), and
     ///   `Window`/`WindowName` are [`Unsupported::WindowTarget`].
     /// - `Pick` blocks until the user chooses, so on Windows and macOS it must not be
-    ///   called from the thread driving the UI, and a user who dismisses the picker gets
-    ///   [`CaptureError::Cancelled`].
+    ///   called from the thread driving the UI (see [`Target::Pick`] for platform threading
+    ///   caveats), and a user who dismisses the picker gets [`CaptureError::Cancelled`].
     ///
     /// [`Unsupported::WindowTarget`]: crate::error::Unsupported::WindowTarget
     /// [`CaptureError::Cancelled`]: crate::error::CaptureError::Cancelled
@@ -102,9 +102,14 @@ pub enum Target {
     /// The inner value is the `HWND` to present the picker from; it has to be a window this
     /// process owns.
     ///
-    /// `create` blocks until the user has chosen, and the wait does not pump messages, so it
-    /// must not be called from the thread that owns that `HWND` (or from any other STA
-    /// thread) — doing so deadlocks.
+    /// # Threading caveat
+    ///
+    /// Microsoft's `GraphicsCapturePicker::PickSingleItemAsync` formally recommends invoking
+    /// the picker on the UI thread without blocking its message loop. Because `scrcap`'s
+    /// synchronous `create` runs `PickSingleItemAsync().join()` (which blocks without pumping
+    /// messages), calling `create` from the thread that owns that `HWND` (or from any other
+    /// STA thread) deadlocks. Invoke `create` from a non-UI, non-STA worker thread while the
+    /// `HWND`'s thread keeps pumping messages.
     #[cfg(target_os = "windows")]
     Pick(isize),
     /// Let the user choose with the system picker.

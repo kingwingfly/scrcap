@@ -135,10 +135,18 @@ fn main() -> Result<()> {
 ## Letting the user choose
 
 `Target::Pick` raises the system picker and blocks until the user has chosen, so it must not
-run on the thread driving the UI: the Windows picker is parented to the `HWND` you pass, whose
-message pump would be the one blocked, and the macOS picker answers on the main queue. Linux
-always shows the portal's picker, whatever the target, and only `Primary`/`Monitor` (monitors
-only) and `Pick` (everything) narrow what it offers.
+run on the thread driving the UI:
+
+- **Windows**: Microsoft's `GraphicsCapturePicker::PickSingleItemAsync` formally recommends
+  invoking the picker on the UI thread without blocking its message loop. Because `scrcap`'s
+  synchronous `create` waits on `PickSingleItemAsync().join()` without pumping messages,
+  calling `create` on the thread that owns the parent `HWND` (or any other STA thread)
+  deadlocks its message pump — run `create` on a non-UI, non-STA worker thread instead while
+  the `HWND`'s thread keeps pumping messages.
+- **macOS**: the picker answers on the main queue, so calling `create` on the main thread
+  deadlocks.
+- **Linux**: the XDG portal always shows its picker regardless of target, and only
+  `Primary`/`Monitor` (monitors only) and `Pick` (everything) narrow what it offers.
 
 ```rust,no_run
 use std::thread;

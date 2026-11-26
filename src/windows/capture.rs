@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicBool, AtomicI32, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
@@ -45,7 +45,7 @@ use windows::{
                 AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR,
                 AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_ENDPOINT_CREATE_FAILED,
                 AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_S_BUFFER_EMPTY, AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient,
+                AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient, IMMDevice,
                 IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX,
                 WAVEFORMATEXTENSIBLE, eConsole, eRender,
             },
@@ -812,12 +812,47 @@ unsafe fn get_buffer_raw(
     }
 }
 
+/// Owns a COM task-memory allocation and releases it with `CoTaskMemFree` on drop.
+struct CoTaskMem<T>(*mut T);
+
+impl<T> Drop for CoTaskMem<T> {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CoTaskMemFree(Some(self.0.cast_const().cast())) };
+        }
+    }
+}
+
+fn device_id(device: &IMMDevice) -> Option<Vec<u16>> {
+    let raw = unsafe { device.GetId() }.ok()?;
+    let guard = CoTaskMem(raw.0);
+    if guard.0.is_null() {
+        return None;
+    }
+    // SAFETY: `IMMDevice::GetId` returns a NUL-terminated UTF-16 string allocated with
+    // `CoTaskMemAlloc`, which stays live until `guard` drops.
+    let id = unsafe { raw.as_wide() }.to_vec();
+    drop(guard);
+    Some(id)
+}
+
+/// How often `Loopback::pump` probes whether the default output device changed.
+const DEFAULT_DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+enum PumpStop {
+    /// Capture terminated or the consumer hung up.
+    Stopped,
+    /// The default output device changed and loopback should re-bind.
+    Rebind,
+}
+
 /// A started WASAPI loopback capture of the default render device.
 ///
 /// Must be dropped while the [`ComApartment`] passed to [`Loopback::start`] is still live.
 struct Loopback {
     audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
+    device_id: Option<Vec<u16>>,
     sample_rate: i32,
     nb_channels: i32,
     sample_fmt: SampleFmt,
@@ -830,75 +865,96 @@ struct Loopback {
 }
 
 impl Loopback {
-    fn start(_com: &ComApartment) -> Result<Self> {
-        unsafe {
-            let device_enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator as *const _, None, CLSCTX_ALL)?;
-            let device = device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-            let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
-            let format = audio_client.GetMixFormat()?;
-            if format.is_null() {
-                return Err(Unsupported::SampleFormat.into());
-            }
-            let sample_fmt = wasapi_sample_fmt(format);
-            let (sample_rate, nb_channels, bits_per_sample, frame_bytes) = (
-                i32::try_from((*format).nSamplesPerSec).unwrap_or(0),
-                (*format).nChannels as i32,
-                (*format).wBitsPerSample as usize,
-                (*format).nBlockAlign as usize,
-            );
-            let init = audio_client.Initialize(
+    fn start(_com: &ComApartment, enumerator: &IMMDeviceEnumerator) -> Result<Self> {
+        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
+        let device_id = device_id(&device);
+        let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        let format = CoTaskMem(unsafe { audio_client.GetMixFormat()? });
+        if format.0.is_null() {
+            return Err(Unsupported::SampleFormat.into());
+        }
+        let sample_fmt = unsafe { wasapi_sample_fmt(format.0) };
+        let (sample_rate, nb_channels, bits_per_sample, frame_bytes) = unsafe {
+            (
+                i32::try_from((*format.0).nSamplesPerSec).unwrap_or(0),
+                (*format.0).nChannels as i32,
+                (*format.0).wBitsPerSample as usize,
+                (*format.0).nBlockAlign as usize,
+            )
+        };
+        let init = unsafe {
+            audio_client.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_LOOPBACK,
                 10_000_000, // 10_000_000 * 100ns = 1s
                 0,
-                format,
+                format.0,
                 None,
-            );
-            CoTaskMemFree(Some(format as *const _));
-            init?;
-            let sample_fmt = sample_fmt.ok_or(Unsupported::SampleFormat)?;
-            let expected_frame_bytes = (nb_channels as usize).checked_mul(bits_per_sample / 8);
-            // Both `sample_rate` and `nb_channels` are divisors in the poll and timeline maths
-            // below, and `nBlockAlign` is the authoritative byte size of one frame.
-            if sample_rate <= 0
-                || nb_channels <= 0
-                || frame_bytes == 0
-                || expected_frame_bytes != Some(frame_bytes)
-            {
-                return Err(Unsupported::SampleFormat.into());
-            }
-            let buffer_frames = audio_client.GetBufferSize()?;
-            let mut device_period = 0i64;
-            audio_client.GetDevicePeriod(Some(&mut device_period), None)?;
-            let capture_client: IAudioCaptureClient = audio_client.GetService()?;
-            audio_client.Start()?;
-            Ok(Self {
-                audio_client,
-                capture_client,
-                sample_rate,
-                nb_channels,
-                sample_fmt,
-                frame_bytes,
-                buffer_frames,
-                // 100 ns units; 10 ms is the shared-mode default if the driver reports none.
-                device_period: u64::try_from(device_period)
-                    .ok()
-                    .filter(|&period| period > 0)
-                    .and_then(|period| period.checked_mul(100))
-                    .unwrap_or(10_000_000),
-            })
+            )
+        };
+        drop(format);
+        init?;
+        let sample_fmt = sample_fmt.ok_or(Unsupported::SampleFormat)?;
+        let expected_frame_bytes = (nb_channels as usize).checked_mul(bits_per_sample / 8);
+        // Both `sample_rate` and `nb_channels` are divisors in the poll and timeline maths
+        // below, and `nBlockAlign` is the authoritative byte size of one frame.
+        if sample_rate <= 0
+            || nb_channels <= 0
+            || frame_bytes == 0
+            || expected_frame_bytes != Some(frame_bytes)
+        {
+            return Err(Unsupported::SampleFormat.into());
         }
+        let buffer_frames = unsafe { audio_client.GetBufferSize()? };
+        let mut device_period = 0i64;
+        unsafe { audio_client.GetDevicePeriod(Some(&mut device_period), None)? };
+        let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService()? };
+        unsafe { audio_client.Start()? };
+        Ok(Self {
+            audio_client,
+            capture_client,
+            device_id,
+            sample_rate,
+            nb_channels,
+            sample_fmt,
+            frame_bytes,
+            buffer_frames,
+            // 100 ns units; 10 ms is the shared-mode default if the driver reports none.
+            device_period: u64::try_from(device_period)
+                .ok()
+                .filter(|&period| period > 0)
+                .and_then(|period| period.checked_mul(100))
+                .unwrap_or(10_000_000),
+        })
     }
 
-    /// Deliver audio until `terminate` is set, the consumer hangs up, or WASAPI fails.
+    /// Returns `true` if Windows' default render console endpoint now has a different ID.
+    ///
+    /// Transient probe failures (e.g. `E_NOTFOUND`) are ignored so `pump` and
+    /// `AUDCLNT_E_DEVICE_INVALIDATED` handling decide whether to re-bind.
+    fn default_device_changed(&self, enumerator: &IMMDeviceEnumerator) -> bool {
+        let Some(active_id) = self.device_id.as_deref() else {
+            return false;
+        };
+        let Ok(default) = (unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }) else {
+            return false;
+        };
+        let Some(default_id) = device_id(&default) else {
+            return false;
+        };
+        default_id.as_slice() != active_id
+    }
+
+    /// Deliver audio until `terminate` is set, the consumer hangs up, the default output device
+    /// changes, or WASAPI fails.
     fn pump(
         &self,
+        enumerator: &IMMDeviceEnumerator,
         tx: &Sender<AudioFrame>,
         wake_rx: &Receiver<()>,
         terminate: &AtomicBool,
         line: &mut Timeline,
-    ) -> Result<()> {
+    ) -> Result<PumpStop> {
         let poll = Duration::from_nanos(
             (1_000_000_000u128 * self.buffer_frames as u128 / self.sample_rate as u128 / 2)
                 .min(10_000_000) as u64,
@@ -914,10 +970,11 @@ impl Loopback {
         // silence right up to now would cover time the next real packet is stamped in, and
         // that packet would then have to be pushed later than it was captured.
         let settled = self.device_period.saturating_mul(3);
+        let mut last_device_check = Instant::now();
         while !terminate.load(Ordering::Acquire) {
             match wake_rx.recv_timeout(poll) {
                 Err(RecvTimeoutError::Timeout) => {}
-                _ => break,
+                _ => return Ok(PumpStop::Stopped),
             }
             let mut delivered = false;
             while unsafe { self.capture_client.GetNextPacketSize()? } != 0 {
@@ -984,6 +1041,15 @@ impl Loopback {
                 self.emit(tx, terminate, line, aframe, nb_frames, ts, false);
                 delivered = true;
             }
+            if terminate.load(Ordering::Acquire) {
+                return Ok(PumpStop::Stopped);
+            }
+            if last_device_check.elapsed() >= DEFAULT_DEVICE_POLL_INTERVAL {
+                last_device_check = Instant::now();
+                if self.default_device_changed(enumerator) {
+                    return Ok(PumpStop::Rebind);
+                }
+            }
             if delivered {
                 continue;
             }
@@ -1007,7 +1073,7 @@ impl Loopback {
             let aframe = vec![silence; silence_bytes];
             self.emit(tx, terminate, line, aframe, nb_samples, None, true);
         }
-        Ok(())
+        Ok(PumpStop::Stopped)
     }
 }
 
@@ -1114,79 +1180,89 @@ impl AudioConfig {
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let (setup_tx, setup_rx) = bounded::<Result<i32>>(1);
         let sample_rate = Arc::new(AtomicI32::new(0));
-        let jh = thread::Builder::new().name("scrcap-audio".to_string()).spawn({
-            let terminate = terminate.clone();
-            let sample_rate = sample_rate.clone();
-            move || {
-                let com = match ComApartment::enter() {
-                    Ok(com) => com,
-                    Err(e) => {
-                        let _ = setup_tx.send(Err(e));
-                        return;
-                    }
-                };
-                let mut loopback = match Loopback::start(&com) {
-                    Ok(loopback) => loopback,
-                    Err(e) => {
-                        let _ = setup_tx.send(Err(e));
-                        return;
-                    }
-                };
-                sample_rate.store(loopback.sample_rate, Ordering::Release);
-                let _ = setup_tx.send(Ok(loopback.sample_rate));
+        let jh = thread::Builder::new()
+            .name("scrcap-audio".to_string())
+            .spawn({
+                let terminate = terminate.clone();
+                let sample_rate = sample_rate.clone();
+                move || {
+                    let com = match ComApartment::enter() {
+                        Ok(com) => com,
+                        Err(e) => {
+                            let _ = setup_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    let enumerator: IMMDeviceEnumerator = match unsafe {
+                        CoCreateInstance(&MMDeviceEnumerator as *const _, None, CLSCTX_ALL)
+                    } {
+                        Ok(enumerator) => enumerator,
+                        Err(e) => {
+                            let _ = setup_tx.send(Err(e.into()));
+                            return;
+                        }
+                    };
+                    let mut loopback = match Loopback::start(&com, &enumerator) {
+                        Ok(loopback) => loopback,
+                        Err(e) => {
+                            let _ = setup_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    sample_rate.store(loopback.sample_rate, Ordering::Release);
+                    let _ = setup_tx.send(Ok(loopback.sample_rate));
 
-                let mut line = Timeline {
-                    next: qpc_now(),
-                    // Nothing has been emitted, so nothing before `next` is a real sample either.
-                    invented: true,
-                };
-                'capture: loop {
-                    match loopback.pump(&tx, &wake_rx, &terminate, &mut line) {
-                        Ok(()) => break,
-                        Err(e) if is_device_invalidated(&e) => {
-                            drop(loopback);
-                            let mut backoff = Duration::from_millis(50);
-                            let mut logged = false;
-                            loop {
-                                if terminate.load(Ordering::Acquire) {
-                                    break 'capture;
+                    let mut line = Timeline {
+                        next: qpc_now(),
+                        // Nothing has been emitted, so nothing before `next` is a real sample either.
+                        invented: true,
+                    };
+                    'capture: loop {
+                        match loopback.pump(&enumerator, &tx, &wake_rx, &terminate, &mut line) {
+                            Ok(PumpStop::Stopped) => break,
+                            Ok(PumpStop::Rebind) => {}
+                            Err(e) if is_device_invalidated(&e) => {}
+                            Err(e) => {
+                                error!("audio capture stopped: {e}");
+                                break;
+                            }
+                        }
+                        drop(loopback);
+                        let mut backoff = Duration::from_millis(50);
+                        let mut logged = false;
+                        loop {
+                            if terminate.load(Ordering::Acquire) {
+                                break 'capture;
+                            }
+                            match Loopback::start(&com, &enumerator) {
+                                Ok(next) => {
+                                    sample_rate.store(next.sample_rate, Ordering::Release);
+                                    loopback = next;
+                                    continue 'capture;
                                 }
-                                match Loopback::start(&com) {
-                                    Ok(next) => {
-                                        sample_rate.store(next.sample_rate, Ordering::Release);
-                                        loopback = next;
-                                        continue 'capture;
+                                Err(err) if is_transient_audio_error(&err) => {
+                                    if !logged {
+                                        warn!(
+                                            "audio device unavailable, waiting to reconnect: {err}"
+                                        );
+                                        logged = true;
                                     }
-                                    Err(err) if is_transient_audio_error(&err) => {
-                                        if !logged {
-                                            warn!(
-                                                "audio device unavailable, waiting to reconnect: {err}"
-                                            );
-                                            logged = true;
+                                    match wake_rx.recv_timeout(backoff) {
+                                        Err(RecvTimeoutError::Timeout) => {
+                                            backoff = (backoff * 2).min(Duration::from_millis(500));
                                         }
-                                        match wake_rx.recv_timeout(backoff) {
-                                            Err(RecvTimeoutError::Timeout) => {
-                                                backoff =
-                                                    (backoff * 2).min(Duration::from_millis(500));
-                                            }
-                                            _ => break 'capture,
-                                        }
+                                        _ => break 'capture,
                                     }
-                                    Err(err) => {
-                                        error!("audio capture stopped: {err}");
-                                        break 'capture;
-                                    }
+                                }
+                                Err(err) => {
+                                    error!("audio capture stopped: {err}");
+                                    break 'capture;
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!("audio capture stopped: {e}");
-                            break;
-                        }
                     }
                 }
-            }
-        })?;
+            })?;
 
         match setup_rx.recv() {
             Ok(Ok(_)) => {}

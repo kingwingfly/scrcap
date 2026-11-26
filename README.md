@@ -83,7 +83,8 @@ Two channels means two receivers to drain, so take whichever has a frame ready. 
 the deeper capacity of the two. `sample_rate()` answers `None` until the system has settled
 the format, which on Linux and macOS happens after `create` returns -- every [`AudioFrame`]
 carries its own rate, so the first frame always answers it. On Windows, switching the default
-output device re-binds loopback capture, so subsequent [`AudioFrame`]s may carry a new sample
+output device -- or invalidating or reconfiguring the active endpoint (unplugged, disabled, or
+format-changed) -- re-binds loopback capture, so subsequent [`AudioFrame`]s may carry a new sample
 rate, channel count, or sample format.
 
 ```rust,no_run
